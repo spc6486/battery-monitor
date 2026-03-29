@@ -18,7 +18,6 @@ import json
 import threading
 import subprocess
 import signal
-import configparser
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -46,7 +45,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
@@ -70,8 +69,6 @@ AVAIL_FREQ_PATH = (
 )
 MAX_FREQ_PATH = "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
 CUR_FREQ_PATH = "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq"
-
-WAYFIRE_INI = os.path.expanduser("~/.config/wayfire.ini")
 
 # Default config
 DEFAULT_CONFIG = {
@@ -203,73 +200,6 @@ def freq_khz_to_mhz(khz):
 def freq_mhz_to_khz(mhz):
     """Convert MHz to kHz for sysfs."""
     return mhz * 1000
-
-
-# ═══════════════════════════════════════════════════════════════
-# Wayfire idle (screen blanking)
-# ═══════════════════════════════════════════════════════════════
-
-def read_wayfire_idle_timeout():
-    """Read dpms_timeout from wayfire.ini [idle] section. Returns minutes."""
-    if not os.path.exists(WAYFIRE_INI):
-        return 0
-    try:
-        cp = configparser.ConfigParser(strict=False)
-        cp.read(WAYFIRE_INI)
-        if cp.has_section("idle") and cp.has_option("idle", "dpms_timeout"):
-            val = int(cp.get("idle", "dpms_timeout"))
-            return max(0, val)
-    except Exception:
-        pass
-    return 0
-
-
-def write_wayfire_idle_timeout(minutes):
-    """Write dpms_timeout to wayfire.ini [idle] section (targeted write)."""
-    minutes = max(0, int(minutes))
-    if not os.path.exists(WAYFIRE_INI):
-        return False
-    try:
-        with open(WAYFIRE_INI, "r") as f:
-            lines = f.readlines()
-
-        in_idle = False
-        found_dpms = False
-        found_idle = False
-        result = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            if stripped.startswith("["):
-                if in_idle and not found_dpms:
-                    result.append(f"dpms_timeout = {minutes}\n")
-                    found_dpms = True
-                in_idle = (stripped == "[idle]")
-                if in_idle:
-                    found_idle = True
-
-            if in_idle and stripped.startswith("dpms_timeout"):
-                result.append(f"dpms_timeout = {minutes}\n")
-                found_dpms = True
-                continue
-
-            result.append(line)
-
-        if in_idle and not found_dpms:
-            result.append(f"dpms_timeout = {minutes}\n")
-            found_dpms = True
-
-        if not found_idle:
-            result.append("\n[idle]\n")
-            result.append(f"dpms_timeout = {minutes}\n")
-
-        with open(WAYFIRE_INI, "w") as f:
-            f.writelines(result)
-        return True
-    except Exception as e:
-        print(f"Error writing wayfire.ini: {e}", file=sys.stderr)
-        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -753,7 +683,7 @@ class SettingsDialog(Gtk.Dialog):
 
 
 class PowerSaverDialog(Gtk.Dialog):
-    """Power saver dialog for CPU governor, freq caps, BT, screen blanking."""
+    """Power saver dialog for CPU governor, frequency caps, and Bluetooth."""
 
     def __init__(self, cfg, on_save):
         super().__init__(
@@ -852,28 +782,6 @@ class PowerSaverDialog(Gtk.Dialog):
         freq_frame.add(freq_grid)
         box.pack_start(freq_frame, False, False, 0)
 
-        # ── Display section ──
-        disp_frame = Gtk.Frame(label="  Display  ")
-        disp_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
-        disp_grid.set_margin_start(12)
-        disp_grid.set_margin_end(12)
-        disp_grid.set_margin_top(8)
-        disp_grid.set_margin_bottom(8)
-
-        disp_grid.attach(Gtk.Label(label="Screen blanking:", xalign=0),
-                         0, 0, 1, 1)
-        self.ps_blank = Gtk.SpinButton.new_with_range(0, 60, 1)
-        self.ps_blank.set_value(read_wayfire_idle_timeout())
-        blank_box = Gtk.Box(spacing=4)
-        blank_box.pack_start(self.ps_blank, False, False, 0)
-        blank_box.pack_start(
-            Gtk.Label(label="min  (0 = never)"), False, False, 0
-        )
-        disp_grid.attach(blank_box, 1, 0, 1, 1)
-
-        disp_frame.add(disp_grid)
-        box.pack_start(disp_frame, False, False, 0)
-
         # ── Buttons ──
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         self.add_button("Save", Gtk.ResponseType.OK)
@@ -903,8 +811,6 @@ class PowerSaverDialog(Gtk.Dialog):
             self.cfg["power_saver"]["max_freq_battery"] = (
                 self._parse_freq_combo(self.freq_bat_combo)
             )
-
-            write_wayfire_idle_timeout(int(self.ps_blank.get_value()))
 
             self.on_save(self.cfg)
         self.destroy()

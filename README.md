@@ -10,7 +10,6 @@ System tray indicator for the MakerFocus UPSPack V3/V3P on Raspberry Pi.
 - **Settings dialog** for thresholds, UPS info, and voltage display
 - **CLI mode** for headless/SSH monitoring
 - **Power saver** — independently toggle CPU governor, frequency cap, and Bluetooth on battery
-- **Screen blanking** — configure display timeout from the Settings dialog
 - **Dynamic CPU capping** — set separate max CPU frequencies for AC and battery
 - **Optional MQTT** publishing (disabled by default)
 - **Single process** — no MQTT broker required for basic operation
@@ -46,7 +45,6 @@ overlay to free the PL011 UART for the UPS — Bluetooth will not be available.
 ### Operating System
 
 Requires Raspberry Pi OS Bookworm (or later) with a GUI desktop.
-Wayfire compositor expected for screen blanking settings.
 
 ## Hardware
 
@@ -101,7 +99,6 @@ Click the tray icon → **Settings…** to configure:
 - CPU power saving on battery (governor switch)
 - CPU max frequency for AC and battery (dynamic, no reboot)
 - Bluetooth disable on battery
-- Screen blanking timeout
 - View UPS model, voltage, power source, and serial port status
 
 ## Uninstall
@@ -156,7 +153,6 @@ mqtt:
 Changes made via the Settings dialog are saved automatically.
 Manual edits take effect after restarting the tray.
 
-Screen blanking is written directly to `~/.config/wayfire.ini` (the `[idle]` section).
 
 ### Changing the serial port
 

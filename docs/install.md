@@ -90,7 +90,6 @@ will offer to remove it along with its systemd service and autostart entries.
 | Path | Contents | Needs reboot |
 |------|----------|:------------:|
 | `/etc/battery-monitor/battery.conf` | Thresholds, power saver options | No |
-| `~/.config/wayfire.ini` | Screen blanking timeout (`[idle]` section) | No |
 
 ## Uninstall
 
