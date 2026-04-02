@@ -27,7 +27,7 @@ try:
 except (ValueError, ImportError):
     AppIndicator3 = None
 
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, Gdk
 
 try:
     import serial
@@ -45,7 +45,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
@@ -537,69 +537,108 @@ def get_best_icon(percent, ac_power):
     return battery_icon_fallback(percent, ac_power)
 
 
+
 # ═══════════════════════════════════════════════════════════════
-# Settings Dialog
+# Settings Window (tabbed)
 # ═══════════════════════════════════════════════════════════════
 
-class SettingsDialog(Gtk.Dialog):
-    """Settings dialog for UPS info, shutdown thresholds, notifications."""
+class BatterySettingsWindow(Gtk.Window):
+    """Tabbed settings window matching kiosk-manager UI pattern."""
 
     def __init__(self, parent_data, cfg, reader, on_save):
-        super().__init__(
-            title="Battery Monitor Settings",
-            flags=Gtk.DialogFlags.MODAL,
-        )
+        super().__init__(title="Battery Monitor", default_width=420)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
         self.set_resizable(False)
+
         self.cfg = _deep_copy(cfg)
         self.on_save = on_save
+        self.parent_data = parent_data or {}
+        self.reader = reader
 
-        box = self.get_content_area()
-        box.set_spacing(12)
-        box.set_margin_start(16)
-        box.set_margin_end(16)
-        box.set_margin_top(12)
-        box.set_margin_bottom(8)
+        self._build_ui()
 
-        # ── UPS Info section ──
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.set_margin_start(12)
+        outer.set_margin_end(12)
+        outer.set_margin_top(8)
+        outer.set_margin_bottom(8)
+        self.add(outer)
+
+        # ── Header ──
+        header = Gtk.Label()
+        header.set_markup(
+            f"<big><b>Battery Monitor</b></big>  <small>v{VERSION}</small>"
+        )
+        header.set_xalign(0)
+        outer.pack_start(header, False, False, 0)
+
+        d = self.parent_data
+        if d.get("ac_power") is True:
+            pct = d.get("bat_percent", 0)
+            state = f"Charging ({pct}%)" if pct < 95 else f"Full ({pct}%)"
+        elif d.get("ac_power") is False:
+            state = f"Battery ({d.get('bat_percent', 0)}%)"
+        else:
+            state = "Not connected"
+
+        port = self.cfg["serial"]["port"]
+        if self.reader and self.reader.is_connected():
+            port_str = f"{port} connected"
+        elif d:
+            port_str = f"{port} connected"
+        else:
+            port_str = f"{port} not responding"
+
+        info = Gtk.Label()
+        info.set_markup(
+            f"<small>Status: <b>{state}</b>    "
+            f"Port: <b>{port_str}</b></small>"
+        )
+        info.set_xalign(0)
+        outer.pack_start(info, False, False, 0)
+
+        # ── Notebook (tabs) ──
+        notebook = Gtk.Notebook()
+        outer.pack_start(notebook, True, True, 4)
+
+        # ═══ TAB 1: Settings ═══
+        settings_page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        settings_page.set_margin_start(8)
+        settings_page.set_margin_end(8)
+        settings_page.set_margin_top(8)
+        settings_page.set_margin_bottom(8)
+        notebook.append_page(settings_page, Gtk.Label(label="Settings"))
+
+        # UPS Info
         info_frame = Gtk.Frame(label="  UPS Information  ")
-        info_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        info_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         info_grid.set_margin_start(12)
         info_grid.set_margin_end(12)
-        info_grid.set_margin_top(8)
-        info_grid.set_margin_bottom(8)
+        info_grid.set_margin_top(6)
+        info_grid.set_margin_bottom(6)
 
-        d = parent_data or {}
         self._add_info_row(info_grid, 0, "UPS Model:",
                            d.get("ups_version", "—"))
         self._add_info_row(info_grid, 1, "Output Voltage:",
                            f"{d.get('vout_volts', 0):.2f} V"
                            if d.get("vout_volts") else "—")
-        self._add_info_row(info_grid, 2, "Power Source:",
-                           "Connected" if d.get("ac_power") is True
-                           else "Battery" if d.get("ac_power") is False
-                           else "—")
-
-        port = cfg["serial"]["port"]
-        if reader and reader.is_connected():
-            port_status = f"{port}  (connected)"
-        elif d:
-            port_status = f"{port}  (connected)"
-        else:
-            port_status = f"{port}  (not responding)"
-        self._add_info_row(info_grid, 3, "Serial Port:", port_status)
 
         info_frame.add(info_grid)
-        box.pack_start(info_frame, False, False, 0)
+        settings_page.pack_start(info_frame, False, False, 0)
 
-        # ── Shutdown section ──
+        # Shutdown
         sd_frame = Gtk.Frame(label="  Low Battery Shutdown  ")
-        sd_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        sd_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         sd_grid.set_margin_start(12)
         sd_grid.set_margin_end(12)
-        sd_grid.set_margin_top(8)
-        sd_grid.set_margin_bottom(8)
+        sd_grid.set_margin_top(6)
+        sd_grid.set_margin_bottom(6)
 
-        sd = cfg.get("shutdown", {})
+        sd = self.cfg.get("shutdown", {})
 
         self.sd_enable = Gtk.CheckButton(label="Enable auto-shutdown")
         self.sd_enable.set_active(sd.get("enable", True))
@@ -624,17 +663,17 @@ class SettingsDialog(Gtk.Dialog):
         sd_grid.attach(confirm_box, 1, 2, 1, 1)
 
         sd_frame.add(sd_grid)
-        box.pack_start(sd_frame, False, False, 0)
+        settings_page.pack_start(sd_frame, False, False, 0)
 
-        # ── Notification section ──
+        # Notifications
         nf_frame = Gtk.Frame(label="  Notifications  ")
-        nf_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        nf_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         nf_grid.set_margin_start(12)
         nf_grid.set_margin_end(12)
-        nf_grid.set_margin_top(8)
-        nf_grid.set_margin_bottom(8)
+        nf_grid.set_margin_top(6)
+        nf_grid.set_margin_bottom(6)
 
-        nf = cfg.get("notifications", {})
+        nf = self.cfg.get("notifications", {})
 
         self.nf_enable = Gtk.CheckButton(label="Enable low battery warning")
         self.nf_enable.set_active(nf.get("enable", True))
@@ -649,67 +688,27 @@ class SettingsDialog(Gtk.Dialog):
         nf_grid.attach(warn_box, 1, 1, 1, 1)
 
         nf_frame.add(nf_grid)
-        box.pack_start(nf_frame, False, False, 0)
+        settings_page.pack_start(nf_frame, False, False, 0)
 
-        # ── Buttons ──
-        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        self.add_button("Save", Gtk.ResponseType.OK)
-
-        self.connect("response", self._on_response)
-        self.show_all()
-
-    def _add_info_row(self, grid, row, label, value):
-        lbl = Gtk.Label(label=label, xalign=0)
-        lbl.set_markup(f"<b>{label}</b>")
-        grid.attach(lbl, 0, row, 1, 1)
-        val = Gtk.Label(label=str(value), xalign=0, selectable=True)
-        grid.attach(val, 1, row, 1, 1)
-
-    def _on_response(self, dialog, response):
-        if response == Gtk.ResponseType.OK:
-            self.cfg["shutdown"]["enable"] = self.sd_enable.get_active()
-            self.cfg["shutdown"]["low_percent"] = int(
-                self.sd_low.get_value()
-            )
-            self.cfg["shutdown"]["confirm_seconds"] = int(
-                self.sd_confirm.get_value()
-            )
-            self.cfg["notifications"]["enable"] = self.nf_enable.get_active()
-            self.cfg["notifications"]["warn_percent"] = int(
-                self.nf_warn.get_value()
-            )
-            self.on_save(self.cfg)
-        self.destroy()
-
-
-class PowerSaverDialog(Gtk.Dialog):
-    """Power saver dialog for CPU governor, frequency caps, and Bluetooth."""
-
-    def __init__(self, cfg, on_save):
-        super().__init__(
-            title="Power Saver",
-            flags=Gtk.DialogFlags.MODAL,
+        # ═══ TAB 2: Power Saver ═══
+        power_page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
         )
-        self.set_resizable(False)
-        self.cfg = _deep_copy(cfg)
-        self.on_save = on_save
+        power_page.set_margin_start(8)
+        power_page.set_margin_end(8)
+        power_page.set_margin_top(8)
+        power_page.set_margin_bottom(8)
+        notebook.append_page(power_page, Gtk.Label(label="Power Saver"))
 
-        box = self.get_content_area()
-        box.set_spacing(12)
-        box.set_margin_start(16)
-        box.set_margin_end(16)
-        box.set_margin_top(12)
-        box.set_margin_bottom(8)
+        ps = self.cfg.get("power_saver", {})
 
-        ps = cfg.get("power_saver", {})
-
-        # ── On Battery section ──
+        # On Battery
         bat_frame = Gtk.Frame(label="  On Battery  ")
-        bat_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        bat_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         bat_grid.set_margin_start(12)
         bat_grid.set_margin_end(12)
-        bat_grid.set_margin_top(8)
-        bat_grid.set_margin_bottom(8)
+        bat_grid.set_margin_top(6)
+        bat_grid.set_margin_bottom(6)
 
         self.ps_cpu = Gtk.CheckButton(
             label="Switch CPU to power saving on battery"
@@ -724,15 +723,15 @@ class PowerSaverDialog(Gtk.Dialog):
         bat_grid.attach(self.ps_bt, 0, 1, 2, 1)
 
         bat_frame.add(bat_grid)
-        box.pack_start(bat_frame, False, False, 0)
+        power_page.pack_start(bat_frame, False, False, 0)
 
-        # ── CPU Frequency section ──
+        # CPU Frequency
         freq_frame = Gtk.Frame(label="  CPU Frequency  ")
-        freq_grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        freq_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         freq_grid.set_margin_start(12)
         freq_grid.set_margin_end(12)
-        freq_grid.set_margin_top(8)
-        freq_grid.set_margin_bottom(8)
+        freq_grid.set_margin_top(6)
+        freq_grid.set_margin_bottom(6)
 
         avail = get_available_frequencies()
         avail_mhz = [freq_khz_to_mhz(f) for f in avail] if avail else []
@@ -772,47 +771,71 @@ class PowerSaverDialog(Gtk.Dialog):
         freq_grid.attach(self.freq_bat_combo, 1, 1, 1, 1)
 
         # Current status
-        gov = PowerSaver(cfg).get_current_governor()
+        gov = PowerSaver(self.cfg).get_current_governor()
         cur_mhz = freq_khz_to_mhz(get_current_freq())
         max_mhz = freq_khz_to_mhz(get_current_max_freq())
-        status = f"{gov}, {cur_mhz}/{max_mhz} MHz"
+        status_str = f"{gov}, {cur_mhz}/{max_mhz} MHz"
         freq_grid.attach(Gtk.Label(label="Current:", xalign=0), 0, 2, 1, 1)
-        freq_grid.attach(Gtk.Label(label=status, xalign=0), 1, 2, 1, 1)
+        freq_grid.attach(Gtk.Label(label=status_str, xalign=0), 1, 2, 1, 1)
 
         freq_frame.add(freq_grid)
-        box.pack_start(freq_frame, False, False, 0)
+        power_page.pack_start(freq_frame, False, False, 0)
 
-        # ── Buttons ──
-        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        self.add_button("Save", Gtk.ResponseType.OK)
+        # ── Bottom button bar ──
+        btn_box = Gtk.Box(spacing=8)
+        btn_box.set_margin_top(4)
 
-        self.connect("response", self._on_response)
-        self.show_all()
+        spacer = Gtk.Label()
+        btn_box.pack_start(spacer, True, True, 0)
+
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda _: self.destroy())
+        btn_box.pack_start(close_btn, False, False, 0)
+
+        apply_btn = Gtk.Button(label="Apply")
+        apply_btn.get_style_context().add_class("suggested-action")
+        apply_btn.connect("clicked", self._on_apply)
+        btn_box.pack_start(apply_btn, False, False, 0)
+
+        outer.pack_start(btn_box, False, False, 0)
+
+    def _add_info_row(self, grid, row, label, value):
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.set_markup(f"<b>{label}</b>")
+        grid.attach(lbl, 0, row, 1, 1)
+        val = Gtk.Label(label=str(value), xalign=0, selectable=True)
+        grid.attach(val, 1, row, 1, 1)
 
     def _parse_freq_combo(self, combo):
-        """Parse a freq combo selection. Returns kHz or 0 for default."""
         idx = combo.get_active()
         if idx <= 0:
             return 0
         mhz = self._avail_mhz[idx - 1]
         return freq_mhz_to_khz(mhz)
 
-    def _on_response(self, dialog, response):
-        if response == Gtk.ResponseType.OK:
-            self.cfg["power_saver"]["cpu_governor"] = (
-                self.ps_cpu.get_active()
-            )
-            self.cfg["power_saver"]["disable_bluetooth"] = (
-                self.ps_bt.get_active()
-            )
-            self.cfg["power_saver"]["max_freq_ac"] = (
-                self._parse_freq_combo(self.freq_ac_combo)
-            )
-            self.cfg["power_saver"]["max_freq_battery"] = (
-                self._parse_freq_combo(self.freq_bat_combo)
-            )
-
-            self.on_save(self.cfg)
+    def _on_apply(self, _btn):
+        # Settings tab
+        self.cfg["shutdown"]["enable"] = self.sd_enable.get_active()
+        self.cfg["shutdown"]["low_percent"] = int(self.sd_low.get_value())
+        self.cfg["shutdown"]["confirm_seconds"] = int(
+            self.sd_confirm.get_value()
+        )
+        self.cfg["notifications"]["enable"] = self.nf_enable.get_active()
+        self.cfg["notifications"]["warn_percent"] = int(
+            self.nf_warn.get_value()
+        )
+        # Power Saver tab
+        self.cfg["power_saver"]["cpu_governor"] = self.ps_cpu.get_active()
+        self.cfg["power_saver"]["disable_bluetooth"] = (
+            self.ps_bt.get_active()
+        )
+        self.cfg["power_saver"]["max_freq_ac"] = (
+            self._parse_freq_combo(self.freq_ac_combo)
+        )
+        self.cfg["power_saver"]["max_freq_battery"] = (
+            self._parse_freq_combo(self.freq_bat_combo)
+        )
+        self.on_save(self.cfg)
         self.destroy()
 
 
@@ -886,23 +909,24 @@ class BatteryTray:
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        self._add_item("Settings…", self._on_settings)
-        self._add_item("Power Saver…", self._on_power_saver)
+        item = Gtk.MenuItem(label="Battery Settings…")
+        item.connect("activate", self._on_settings)
+        self.menu.append(item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        self._add_item("Quit", self._on_quit)
+        uninstall = Gtk.MenuItem(label="Uninstall Battery Monitor")
+        uninstall.connect("activate", self._on_uninstall)
+        self.menu.append(uninstall)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit)
+        self.menu.append(quit_item)
 
         self.menu.show_all()
 
         if self.indicator:
             self.indicator.set_menu(self.menu)
-
-    def _add_item(self, label, callback):
-        item = Gtk.MenuItem(label=label)
-        item.connect("activate", callback)
-        self.menu.append(item)
-        return item
 
     # ── Serial reader (background thread) ────────────────────
 
@@ -978,21 +1002,6 @@ class BatteryTray:
         except FileNotFoundError:
             pass
 
-    # ── Callbacks ────────────────────────────────────────────
-
-    def _on_settings(self, _widget):
-        SettingsDialog(self.data, self.cfg, self.reader, self._save_settings)
-
-    def _on_power_saver(self, _widget):
-        PowerSaverDialog(self.cfg, self._save_settings)
-
-    def _save_settings(self, new_cfg):
-        self.cfg = new_cfg
-        if save_config(new_cfg):
-            self.guard.update_config(new_cfg)
-            self.mqtt.update_config(new_cfg)
-            self.power.update_config(new_cfg)
-
     def _write_status_file(self, data):
         """Write latest UPS data to a JSON file for external consumers."""
         try:
@@ -1003,6 +1012,47 @@ class BatteryTray:
         except Exception:
             pass
 
+    # ── Callbacks ────────────────────────────────────────────
+
+    def _on_settings(self, _widget):
+        win = BatterySettingsWindow(
+            self.data, self.cfg, self.reader, self._save_settings
+        )
+        win.connect("destroy", lambda _: None)
+        win.show_all()
+
+    def _save_settings(self, new_cfg):
+        self.cfg = new_cfg
+        if save_config(new_cfg):
+            self.guard.update_config(new_cfg)
+            self.mqtt.update_config(new_cfg)
+            self.power.update_config(new_cfg)
+
+    def _on_uninstall(self, _widget):
+        dlg = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text="Uninstall Battery Monitor?",
+        )
+        dlg.format_secondary_text(
+            "This will remove the application, launcher, autostart, "
+            "and sudoers rule. Configuration can be kept or removed."
+        )
+        response = dlg.run()
+        dlg.destroy()
+        if response == Gtk.ResponseType.YES:
+            self.reader.close()
+            try:
+                os.unlink(STATUS_FILE)
+            except FileNotFoundError:
+                pass
+            subprocess.Popen(
+                ["pkexec", "/opt/battery-monitor/install.sh", "--uninstall"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            Gtk.main_quit()
+
     def _on_quit(self, _widget):
         self.reader.close()
         try:
@@ -1010,7 +1060,6 @@ class BatteryTray:
         except FileNotFoundError:
             pass
         Gtk.main_quit()
-
 
 # ═══════════════════════════════════════════════════════════════
 # CLI Status

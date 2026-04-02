@@ -93,15 +93,22 @@ Prints live UPS data to terminal — useful over SSH.
 
 ### Settings
 
-Click the tray icon → **Settings…** to configure:
+Click the tray icon → **Battery Settings…** to open the settings window.
+
+**Settings tab:**
+- UPS model and output voltage
 - Shutdown threshold and confirm delay
 - Low battery warning level
-- CPU power saving on battery (governor switch)
+
+**Power Saver tab:**
+- CPU governor switching on battery
 - CPU max frequency for AC and battery (dynamic, no reboot)
 - Bluetooth disable on battery
-- View UPS model, voltage, power source, and serial port status
+- Current governor and frequency status
 
 ## Uninstall
+
+From the tray menu: **Uninstall Battery Monitor** (confirms before removing).
 
 From the application menu: right-click Battery Monitor → **Uninstall**.
 

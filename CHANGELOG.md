@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2
+
+- Unified Settings and Power Saver into single tabbed window
+  (matches kiosk-manager UI pattern)
+- Added Uninstall option to tray menu (with confirmation dialog)
+- Window uses Gtk.Window with Notebook tabs instead of separate Dialogs
+- Header shows version, battery status, and serial port status
+- Bottom bar with Close + Apply buttons
+
 ## 1.0.1
 
 - Added status file (`$XDG_RUNTIME_DIR/battery-monitor-status.json`) for
