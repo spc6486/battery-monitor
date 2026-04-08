@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3
+
+- CLI mode falls back to status file when serial port is held by tray app
+- Added "Reboot instead of shutdown" checkbox for auto-restart on AC return
+- CLI shows helpful error when neither serial nor status file is available
+
 ## 1.0.2
 
 - Unified Settings and Power Saver into single tabbed window

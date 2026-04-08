@@ -45,7 +45,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
@@ -662,6 +662,15 @@ class BatterySettingsWindow(Gtk.Window):
         confirm_box.pack_start(Gtk.Label(label="sec"), False, False, 0)
         sd_grid.attach(confirm_box, 1, 2, 1, 1)
 
+        self.sd_reboot = Gtk.CheckButton(label="Reboot instead of shutdown")
+        self.sd_reboot.set_tooltip_text(
+            "Reboot allows the Pi to restart automatically\n"
+            "when AC power returns after a low battery shutdown.")
+        self.sd_reboot.set_active(
+            "shutdown -r" in sd.get("command", "")
+        )
+        sd_grid.attach(self.sd_reboot, 0, 3, 2, 1)
+
         sd_frame.add(sd_grid)
         settings_page.pack_start(sd_frame, False, False, 0)
 
@@ -820,6 +829,14 @@ class BatterySettingsWindow(Gtk.Window):
         self.cfg["shutdown"]["confirm_seconds"] = int(
             self.sd_confirm.get_value()
         )
+        if self.sd_reboot.get_active():
+            self.cfg["shutdown"]["command"] = (
+                'sudo /sbin/shutdown -r now "UPS low battery — rebooting"'
+            )
+        else:
+            self.cfg["shutdown"]["command"] = (
+                'sudo /sbin/shutdown -h now "UPS low battery"'
+            )
         self.cfg["notifications"]["enable"] = self.nf_enable.get_active()
         self.cfg["notifications"]["warn_percent"] = int(
             self.nf_warn.get_value()
@@ -1079,28 +1096,50 @@ def cli_status():
     print(f"CPU freq:    {cur}/{cap} MHz")
     print()
 
+    # If tray app is running, read from its status file
+    if os.path.exists(STATUS_FILE):
+        print("Reading from tray app (Ctrl+C to stop)...")
+        try:
+            while True:
+                try:
+                    with open(STATUS_FILE, "r") as f:
+                        d = json.load(f)
+                    ac = "AC" if d.get("ac_power") else "BAT"
+                    print(f"  {d.get('vin_state','?')} "
+                          f"BAT={d.get('bat_percent',0)}%"
+                          f" V={d.get('vout_volts',0):.2f}V [{ac}]"
+                          f"  ({d.get('ups_version','?')})")
+                    time.sleep(2)
+                except (json.JSONDecodeError, KeyError):
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        return
+
+    # No tray running — try serial directly
     reader = UPSReader(
         cfg["serial"]["port"],
         cfg["serial"]["baud"],
         cfg["serial"]["timeout_s"],
     )
-    if not reader.open():
-        print("ERROR: Cannot open serial port")
+    if reader.open():
+        print("Reading UPS directly (Ctrl+C to stop)...")
+        try:
+            while True:
+                d = reader.read_once()
+                if d:
+                    ac = "AC" if d["ac_power"] else "BAT"
+                    print(f"  {d['vin_state']} BAT={d['bat_percent']}%"
+                          f" V={d['vout_volts']:.2f}V [{ac}]"
+                          f"  ({d['ups_version']})")
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        finally:
+            reader.close()
         return
 
-    print("Reading UPS (Ctrl+C to stop)...")
-    try:
-        while True:
-            d = reader.read_once()
-            if d:
-                ac = "AC" if d["ac_power"] else "BAT"
-                print(f"  {d['vin_state']} BAT={d['bat_percent']}%"
-                      f" V={d['vout_volts']:.2f}V [{ac}]"
-                      f"  ({d['ups_version']})")
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        reader.close()
+    print("ERROR: No status file and cannot open serial port.")
+    print("       Start the tray app or check the serial connection.")
 
 
 # ═══════════════════════════════════════════════════════════════
