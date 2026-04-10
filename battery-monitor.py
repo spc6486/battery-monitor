@@ -45,7 +45,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
@@ -94,6 +94,8 @@ DEFAULT_CONFIG = {
         "max_freq_ac": 0,
         "max_freq_battery": 0,
         "disable_bluetooth": False,
+        "disable_wifi": False,
+        "reduce_refresh_rate": False,
     },
     "mqtt": {
         "enable": False,
@@ -203,6 +205,76 @@ def freq_mhz_to_khz(mhz):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Display Refresh Rate (wlr-randr)
+# ═══════════════════════════════════════════════════════════════
+
+def detect_hdmi_output():
+    """Detect the HDMI output name from wlr-randr. Returns name or None."""
+    try:
+        out = subprocess.check_output(
+            ["wlr-randr"], text=True, timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("HDMI-"):
+                return line.split()[0]
+    except Exception:
+        pass
+    return None
+
+
+def get_current_refresh_rate():
+    """Read current refresh rate in Hz from wlr-randr. Returns int or 0."""
+    try:
+        out = subprocess.check_output(
+            ["wlr-randr"], text=True, timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if "current" in line and "Hz" in line:
+                m = re.search(r"([\d.]+)\s*Hz", line)
+                if m:
+                    return int(float(m.group(1)))
+    except Exception:
+        pass
+    return 0
+
+
+def set_refresh_rate(hz):
+    """Set HDMI output refresh rate via wlr-randr. Returns True on success."""
+    output = detect_hdmi_output()
+    if not output:
+        return False
+    # Get current resolution from wlr-randr
+    try:
+        out = subprocess.check_output(
+            ["wlr-randr"], text=True, timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        res = None
+        for line in out.splitlines():
+            if "current" in line and "px" in line:
+                m = re.match(r"\s*(\d+x\d+)\s+px", line)
+                if m:
+                    res = m.group(1)
+                    break
+        if not res:
+            return False
+        subprocess.run(
+            ["wlr-randr", "--output", output,
+             "--custom-mode", f"{res}@{hz}Hz"],
+            check=True, timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as e:
+        print(f"Refresh rate switch failed: {e}", file=sys.stderr)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # UPS Serial Reader
 # ═══════════════════════════════════════════════════════════════
 
@@ -272,7 +344,7 @@ class UPSReader:
 # ═══════════════════════════════════════════════════════════════
 
 class PowerSaver:
-    """Switches CPU governor, frequency cap, and Bluetooth on AC change."""
+    """Switches CPU governor, frequency cap, refresh rate, and BT on AC change."""
 
     def __init__(self, cfg):
         self._prev_ac = None
@@ -284,16 +356,23 @@ class PowerSaver:
         self.gov_ac = ps.get("governor_ac", "ondemand")
         self.gov_bat = ps.get("governor_battery", "powersave")
         self.bt_toggle = ps.get("disable_bluetooth", False)
+        self.wifi_toggle = ps.get("disable_wifi", False)
+        self.refresh_toggle = ps.get("reduce_refresh_rate", False)
 
         # Frequency caps (kHz). 0 = use hardware max.
         self.max_freq_ac = int(ps.get("max_freq_ac", 0))
         self.max_freq_bat = int(ps.get("max_freq_battery", 0))
 
+    def has_any_action(self):
+        """True if any power saver feature is enabled."""
+        return (self.cpu_gov or self.bt_toggle or self.wifi_toggle
+                or self.refresh_toggle)
+
     def tick(self, data):
         """Called each poll cycle. Switches profile on AC state change."""
         if data is None:
             return
-        if not self.cpu_gov and not self.bt_toggle:
+        if not self.has_any_action():
             return
         ac = data["ac_power"]
         if ac == self._prev_ac:
@@ -310,12 +389,15 @@ class PowerSaver:
         if self.max_freq_ac > 0:
             self._set_max_freq(self.max_freq_ac)
         elif self.cpu_gov:
-            # Restore hardware max
             freqs = get_available_frequencies()
             if freqs:
                 self._set_max_freq(freqs[-1])
         if self.bt_toggle:
             self._rfkill_bluetooth(block=False)
+        if self.wifi_toggle:
+            self._rfkill_wifi(block=False)
+        if self.refresh_toggle:
+            set_refresh_rate(60)
 
     def _apply_battery(self):
         if self.cpu_gov:
@@ -324,6 +406,10 @@ class PowerSaver:
             self._set_max_freq(self.max_freq_bat)
         if self.bt_toggle:
             self._rfkill_bluetooth(block=True)
+        if self.wifi_toggle:
+            self._rfkill_wifi(block=True)
+        if self.refresh_toggle:
+            set_refresh_rate(30)
 
     def _set_governor(self, gov):
         for policy in glob.glob(
@@ -365,6 +451,17 @@ class PowerSaver:
         try:
             subprocess.run(
                 ["rfkill", action, "bluetooth"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            pass
+
+    def _rfkill_wifi(self, block):
+        action = "block" if block else "unblock"
+        try:
+            subprocess.run(
+                ["rfkill", action, "wifi"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -731,6 +828,18 @@ class BatterySettingsWindow(Gtk.Window):
         self.ps_bt.set_active(ps.get("disable_bluetooth", False))
         bat_grid.attach(self.ps_bt, 0, 1, 2, 1)
 
+        self.ps_wifi = Gtk.CheckButton(
+            label="Disable Wi-Fi on battery"
+        )
+        self.ps_wifi.set_active(ps.get("disable_wifi", False))
+        bat_grid.attach(self.ps_wifi, 0, 2, 2, 1)
+
+        self.ps_refresh = Gtk.CheckButton(
+            label="Reduce display refresh rate on battery (60→30 Hz)"
+        )
+        self.ps_refresh.set_active(ps.get("reduce_refresh_rate", False))
+        bat_grid.attach(self.ps_refresh, 0, 3, 2, 1)
+
         bat_frame.add(bat_grid)
         power_page.pack_start(bat_frame, False, False, 0)
 
@@ -779,16 +888,37 @@ class BatterySettingsWindow(Gtk.Window):
         self.freq_bat_combo.set_active(bat_active)
         freq_grid.attach(self.freq_bat_combo, 1, 1, 1, 1)
 
-        # Current status
-        gov = PowerSaver(self.cfg).get_current_governor()
-        cur_mhz = freq_khz_to_mhz(get_current_freq())
-        max_mhz = freq_khz_to_mhz(get_current_max_freq())
-        status_str = f"{gov}, {cur_mhz}/{max_mhz} MHz"
+        # Live CPU status (updates every second)
         freq_grid.attach(Gtk.Label(label="Current:", xalign=0), 0, 2, 1, 1)
-        freq_grid.attach(Gtk.Label(label=status_str, xalign=0), 1, 2, 1, 1)
+        self._freq_label = Gtk.Label(xalign=0)
+        self._update_freq_label()
+        freq_grid.attach(self._freq_label, 1, 2, 1, 1)
 
         freq_frame.add(freq_grid)
         power_page.pack_start(freq_frame, False, False, 0)
+
+        # Display
+        disp_frame = Gtk.Frame(label="  Display  ")
+        disp_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        disp_grid.set_margin_start(12)
+        disp_grid.set_margin_end(12)
+        disp_grid.set_margin_top(6)
+        disp_grid.set_margin_bottom(6)
+
+        refresh_hz = get_current_refresh_rate()
+        disp_grid.attach(Gtk.Label(label="Refresh rate:", xalign=0),
+                         0, 0, 1, 1)
+        self._refresh_label = Gtk.Label(
+            label=f"{refresh_hz} Hz" if refresh_hz else "—", xalign=0
+        )
+        disp_grid.attach(self._refresh_label, 1, 0, 1, 1)
+
+        disp_frame.add(disp_grid)
+        power_page.pack_start(disp_frame, False, False, 0)
+
+        # Start live update timer
+        self._freq_timer = GLib.timeout_add(1000, self._update_freq_label)
+        self.connect("destroy", self._on_destroy)
 
         # ── Bottom button bar ──
         btn_box = Gtk.Box(spacing=8)
@@ -814,6 +944,19 @@ class BatterySettingsWindow(Gtk.Window):
         grid.attach(lbl, 0, row, 1, 1)
         val = Gtk.Label(label=str(value), xalign=0, selectable=True)
         grid.attach(val, 1, row, 1, 1)
+
+    def _update_freq_label(self):
+        """Update the live CPU frequency display."""
+        gov = PowerSaver(self.cfg).get_current_governor()
+        cur = freq_khz_to_mhz(get_current_freq())
+        cap = freq_khz_to_mhz(get_current_max_freq())
+        self._freq_label.set_text(f"{gov}, {cur}/{cap} MHz")
+        return True  # keep timer alive
+
+    def _on_destroy(self, _widget):
+        """Stop the freq update timer when window closes."""
+        if hasattr(self, "_freq_timer"):
+            GLib.source_remove(self._freq_timer)
 
     def _parse_freq_combo(self, combo):
         idx = combo.get_active()
@@ -846,11 +989,17 @@ class BatterySettingsWindow(Gtk.Window):
         self.cfg["power_saver"]["disable_bluetooth"] = (
             self.ps_bt.get_active()
         )
+        self.cfg["power_saver"]["disable_wifi"] = (
+            self.ps_wifi.get_active()
+        )
         self.cfg["power_saver"]["max_freq_ac"] = (
             self._parse_freq_combo(self.freq_ac_combo)
         )
         self.cfg["power_saver"]["max_freq_battery"] = (
             self._parse_freq_combo(self.freq_bat_combo)
+        )
+        self.cfg["power_saver"]["reduce_refresh_rate"] = (
+            self.ps_refresh.get_active()
         )
         self.on_save(self.cfg)
         self.destroy()
@@ -876,6 +1025,7 @@ class BatteryTray:
         self.guard = ShutdownGuard(self.cfg)
         self.mqtt = MQTTPublisher(self.cfg)
         self.power = PowerSaver(self.cfg)
+        self._cached_refresh_hz = get_current_refresh_rate()
 
         self._build_indicator()
         self._build_menu()
@@ -886,6 +1036,7 @@ class BatteryTray:
         self._reader_thread.start()
 
         GLib.timeout_add_seconds(2, self._update_ui)
+        GLib.timeout_add_seconds(30, self._update_refresh_cache)
 
     # ── Indicator ────────────────────────────────────────────
 
@@ -1019,12 +1170,20 @@ class BatteryTray:
         except FileNotFoundError:
             pass
 
+    def _update_refresh_cache(self):
+        """Periodically update the cached refresh rate."""
+        self._cached_refresh_hz = get_current_refresh_rate()
+        return True
+
     def _write_status_file(self, data):
         """Write latest UPS data to a JSON file for external consumers."""
         try:
+            enriched = dict(data)
+            enriched["cpu_freq_mhz"] = freq_khz_to_mhz(get_current_freq())
+            enriched["refresh_hz"] = self._cached_refresh_hz
             tmp = STATUS_FILE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(data, f)
+                json.dump(enriched, f)
             os.replace(tmp, STATUS_FILE)
         except Exception:
             pass
@@ -1094,6 +1253,8 @@ def cli_status():
     cur = freq_khz_to_mhz(get_current_freq())
     cap = freq_khz_to_mhz(get_current_max_freq())
     print(f"CPU freq:    {cur}/{cap} MHz")
+    hz = get_current_refresh_rate()
+    print(f"Refresh:     {hz} Hz" if hz else "Refresh:     —")
     print()
 
     # If tray app is running, read from its status file

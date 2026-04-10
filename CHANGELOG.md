@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+
+- Refresh rate switching: drops HDMI from 60Hz to 30Hz on battery (~0.3–0.5W saved)
+- Wi-Fi disable on battery via rfkill (~0.1–0.3W saved)
+- Installer prompts to enable extended CPU frequency range (arm_freq_min=600)
+- Live CPU frequency display in Power Saver tab (updates every second)
+- Current refresh rate shown in Display section of Power Saver tab
+- CPU frequency and refresh rate included in status file for external tools
+
 ## 1.0.3
 
 - CLI mode falls back to status file when serial port is held by tray app

@@ -210,6 +210,31 @@ if ! groups "$USER_REAL" | grep -q dialout; then
     NEED_REBOOT=1
 fi
 
+# ── 2b. Extended CPU frequency range ────────────────────
+
+if [ -f "$BOOT_CFG" ]; then
+    if ! grep -q '^arm_freq_min=' "$BOOT_CFG" 2>/dev/null; then
+        if [ -t 0 ]; then
+            echo ""
+            info "Enable extended CPU frequency range for better battery life?"
+            echo "  Allows CPU to idle at 600 MHz instead of 1500 MHz."
+            echo "  Improves battery life by ~0.5W at idle. No performance impact"
+            echo "  under load — the CPU still scales up when needed."
+            echo -n "  Enable? [Y/n] "
+            read -r ans
+            if [[ ! "$ans" =~ ^[Nn] ]]; then
+                echo 'arm_freq_min=600' | sudo tee -a "$BOOT_CFG" > /dev/null
+                ok "arm_freq_min=600 added to config.txt"
+                NEED_REBOOT=1
+            else
+                ok "Skipped arm_freq_min"
+            fi
+        fi
+    else
+        ok "arm_freq_min already set"
+    fi
+fi
+
 # ── 3. Disable serial login console ─────────────────────
 
 # raspi-config nonint do_serial 2 = disable console, keep hardware
@@ -327,6 +352,8 @@ power_saver:
   max_freq_ac: 0
   max_freq_battery: 0
   disable_bluetooth: false
+  disable_wifi: false
+  reduce_refresh_rate: false
 
 mqtt:
   enable: false

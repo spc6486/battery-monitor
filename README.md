@@ -9,8 +9,10 @@ System tray indicator for the MakerFocus UPSPack V3/V3P on Raspberry Pi.
 - **Low battery notification** at configurable warning level
 - **Settings dialog** for thresholds, UPS info, and voltage display
 - **CLI mode** for headless/SSH monitoring
-- **Power saver** — independently toggle CPU governor, frequency cap, and Bluetooth on battery
+- **Power saver** — independently toggle CPU governor, frequency cap, Bluetooth, Wi-Fi, and refresh rate on battery
 - **Dynamic CPU capping** — set separate max CPU frequencies for AC and battery
+- **Refresh rate switching** — drops HDMI from 60Hz to 30Hz on battery for power/thermal savings
+- **Live CPU monitoring** — real-time frequency display in the settings window
 - **Optional MQTT** publishing (disabled by default)
 - **Single process** — no MQTT broker required for basic operation
 - **Pi 5 UART** setup handled automatically by installer
@@ -104,7 +106,10 @@ Click the tray icon → **Battery Settings…** to open the settings window.
 - CPU governor switching on battery
 - CPU max frequency for AC and battery (dynamic, no reboot)
 - Bluetooth disable on battery
-- Current governor and frequency status
+- Wi-Fi disable on battery
+- Refresh rate switching on battery (60→30 Hz)
+- Live CPU frequency and governor display
+- Current refresh rate
 
 ## Uninstall
 
