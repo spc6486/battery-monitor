@@ -45,7 +45,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
@@ -396,8 +396,6 @@ class PowerSaver:
             self._rfkill_bluetooth(block=False)
         if self.wifi_toggle:
             self._rfkill_wifi(block=False)
-        if self.refresh_toggle:
-            set_refresh_rate(60)
 
     def _apply_battery(self):
         if self.cpu_gov:
@@ -408,8 +406,13 @@ class PowerSaver:
             self._rfkill_bluetooth(block=True)
         if self.wifi_toggle:
             self._rfkill_wifi(block=True)
+
+    def apply_refresh_rate(self):
+        """Set refresh rate based on config. Call at startup and on save."""
         if self.refresh_toggle:
             set_refresh_rate(30)
+        else:
+            set_refresh_rate(60)
 
     def _set_governor(self, gov):
         for policy in glob.glob(
@@ -835,7 +838,12 @@ class BatterySettingsWindow(Gtk.Window):
         bat_grid.attach(self.ps_wifi, 0, 2, 2, 1)
 
         self.ps_refresh = Gtk.CheckButton(
-            label="Reduce display refresh rate on battery (60→30 Hz)"
+            label="Reduce display refresh rate (60→30 Hz)"
+        )
+        self.ps_refresh.set_tooltip_text(
+            "Lowers HDMI refresh rate to save ~0.3–0.5W.\n"
+            "Applied immediately and persists across reboots.\n"
+            "No visual impact on LCD panels."
         )
         self.ps_refresh.set_active(ps.get("reduce_refresh_rate", False))
         bat_grid.attach(self.ps_refresh, 0, 3, 2, 1)
@@ -946,11 +954,13 @@ class BatterySettingsWindow(Gtk.Window):
         grid.attach(val, 1, row, 1, 1)
 
     def _update_freq_label(self):
-        """Update the live CPU frequency display."""
+        """Update the live CPU frequency and refresh rate display."""
         gov = PowerSaver(self.cfg).get_current_governor()
         cur = freq_khz_to_mhz(get_current_freq())
         cap = freq_khz_to_mhz(get_current_max_freq())
         self._freq_label.set_text(f"{gov}, {cur}/{cap} MHz")
+        hz = get_current_refresh_rate()
+        self._refresh_label.set_text(f"{hz} Hz" if hz else "—")
         return True  # keep timer alive
 
     def _on_destroy(self, _widget):
@@ -1026,6 +1036,9 @@ class BatteryTray:
         self.mqtt = MQTTPublisher(self.cfg)
         self.power = PowerSaver(self.cfg)
         self._cached_refresh_hz = get_current_refresh_rate()
+
+        # Apply persistent refresh rate at startup
+        self.power.apply_refresh_rate()
 
         self._build_indicator()
         self._build_menu()
@@ -1203,6 +1216,7 @@ class BatteryTray:
             self.guard.update_config(new_cfg)
             self.mqtt.update_config(new_cfg)
             self.power.update_config(new_cfg)
+            self.power.apply_refresh_rate()
 
     def _on_uninstall(self, _widget):
         dlg = Gtk.MessageDialog(

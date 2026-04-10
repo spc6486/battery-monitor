@@ -1,8 +1,15 @@
 # Changelog
 
+## 1.1.1
+
+- Refresh rate is now persistent — set once at startup and on Apply, no toggling
+  on AC↔battery transitions (eliminates screen flash on power state changes)
+- Refresh rate display updates live in the settings window
+- Display section separated from CPU Frequency in Power Saver tab
+
 ## 1.1.0
 
-- Refresh rate switching: drops HDMI from 60Hz to 30Hz on battery (~0.3–0.5W saved)
+- Refresh rate switching: drops HDMI from 60Hz to 30Hz (~0.3–0.5W saved)
 - Wi-Fi disable on battery via rfkill (~0.1–0.3W saved)
 - Installer prompts to enable extended CPU frequency range (arm_freq_min=600)
 - Live CPU frequency display in Power Saver tab (updates every second)
