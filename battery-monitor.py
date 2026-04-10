@@ -959,8 +959,9 @@ class BatterySettingsWindow(Gtk.Window):
         cur = freq_khz_to_mhz(get_current_freq())
         cap = freq_khz_to_mhz(get_current_max_freq())
         self._freq_label.set_text(f"{gov}, {cur}/{cap} MHz")
-        hz = get_current_refresh_rate()
-        self._refresh_label.set_text(f"{hz} Hz" if hz else "—")
+        if hasattr(self, "_refresh_label"):
+            hz = get_current_refresh_rate()
+            self._refresh_label.set_text(f"{hz} Hz" if hz else "—")
         return True  # keep timer alive
 
     def _on_destroy(self, _widget):
