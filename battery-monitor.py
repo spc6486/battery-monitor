@@ -837,17 +837,6 @@ class BatterySettingsWindow(Gtk.Window):
         self.ps_wifi.set_active(ps.get("disable_wifi", False))
         bat_grid.attach(self.ps_wifi, 0, 2, 2, 1)
 
-        self.ps_refresh = Gtk.CheckButton(
-            label="Reduce display refresh rate (60→30 Hz)"
-        )
-        self.ps_refresh.set_tooltip_text(
-            "Lowers HDMI refresh rate to save ~0.3–0.5W.\n"
-            "Applied immediately and persists across reboots.\n"
-            "No visual impact on LCD panels."
-        )
-        self.ps_refresh.set_active(ps.get("reduce_refresh_rate", False))
-        bat_grid.attach(self.ps_refresh, 0, 3, 2, 1)
-
         bat_frame.add(bat_grid)
         power_page.pack_start(bat_frame, False, False, 0)
 
@@ -913,13 +902,24 @@ class BatterySettingsWindow(Gtk.Window):
         disp_grid.set_margin_top(6)
         disp_grid.set_margin_bottom(6)
 
+        self.ps_refresh = Gtk.CheckButton(
+            label="Reduce refresh rate (60→30 Hz)"
+        )
+        self.ps_refresh.set_tooltip_text(
+            "Lowers HDMI refresh rate to save ~0.3–0.5W.\n"
+            "Applied immediately and persists across reboots.\n"
+            "No visual impact on LCD panels."
+        )
+        self.ps_refresh.set_active(ps.get("reduce_refresh_rate", False))
+        disp_grid.attach(self.ps_refresh, 0, 0, 2, 1)
+
+        disp_grid.attach(Gtk.Label(label="Current:", xalign=0),
+                         0, 1, 1, 1)
         refresh_hz = get_current_refresh_rate()
-        disp_grid.attach(Gtk.Label(label="Refresh rate:", xalign=0),
-                         0, 0, 1, 1)
         self._refresh_label = Gtk.Label(
             label=f"{refresh_hz} Hz" if refresh_hz else "—", xalign=0
         )
-        disp_grid.attach(self._refresh_label, 1, 0, 1, 1)
+        disp_grid.attach(self._refresh_label, 1, 1, 1, 1)
 
         disp_frame.add(disp_grid)
         power_page.pack_start(disp_frame, False, False, 0)
@@ -1038,8 +1038,8 @@ class BatteryTray:
         self.power = PowerSaver(self.cfg)
         self._cached_refresh_hz = get_current_refresh_rate()
 
-        # Apply persistent refresh rate at startup
-        self.power.apply_refresh_rate()
+        # Apply persistent refresh rate after compositor settles
+        GLib.timeout_add_seconds(3, self._apply_startup_refresh)
 
         self._build_indicator()
         self._build_menu()
@@ -1188,6 +1188,12 @@ class BatteryTray:
         """Periodically update the cached refresh rate."""
         self._cached_refresh_hz = get_current_refresh_rate()
         return True
+
+    def _apply_startup_refresh(self):
+        """Apply persistent refresh rate after compositor settles."""
+        self.power.apply_refresh_rate()
+        self._cached_refresh_hz = get_current_refresh_rate()
+        return False  # one-shot
 
     def _write_status_file(self, data):
         """Write latest UPS data to a JSON file for external consumers."""
