@@ -242,11 +242,17 @@ def get_current_refresh_rate():
 
 
 def set_refresh_rate(hz):
-    """Set HDMI output refresh rate via wlr-randr. Returns True on success."""
+    """Set HDMI refresh rate via wlr-randr custom mode.
+    Returns True on success. Does NOT modify kanshi config
+    (custom modes aren't in EDID and would break kanshi)."""
+    current_hz = get_current_refresh_rate()
+    if current_hz == hz:
+        return True
+    if current_hz == 0:
+        return False  # compositor not ready
     output = detect_hdmi_output()
     if not output:
         return False
-    # Get current resolution from wlr-randr
     try:
         out = subprocess.check_output(
             ["wlr-randr"], text=True, timeout=3,
@@ -269,8 +275,7 @@ def set_refresh_rate(hz):
             stderr=subprocess.DEVNULL,
         )
         return True
-    except Exception as e:
-        print(f"Refresh rate switch failed: {e}", file=sys.stderr)
+    except Exception:
         return False
 
 
@@ -907,7 +912,7 @@ class BatterySettingsWindow(Gtk.Window):
         )
         self.ps_refresh.set_tooltip_text(
             "Lowers HDMI refresh rate to save ~0.3–0.5W.\n"
-            "Applied immediately and persists across reboots.\n"
+            "Applied at startup while battery-monitor is running.\n"
             "No visual impact on LCD panels."
         )
         self.ps_refresh.set_active(ps.get("reduce_refresh_rate", False))
@@ -1038,7 +1043,7 @@ class BatteryTray:
         self.power = PowerSaver(self.cfg)
         self._cached_refresh_hz = get_current_refresh_rate()
 
-        # Apply persistent refresh rate after compositor settles
+        # Apply refresh rate (fallback for non-kanshi systems)
         GLib.timeout_add_seconds(3, self._apply_startup_refresh)
 
         self._build_indicator()
@@ -1190,10 +1195,17 @@ class BatteryTray:
         return True
 
     def _apply_startup_refresh(self):
-        """Apply persistent refresh rate after compositor settles."""
-        self.power.apply_refresh_rate()
-        self._cached_refresh_hz = get_current_refresh_rate()
-        return False  # one-shot
+        """Apply refresh rate after compositor settles.
+        Retries up to 5 times since kanshi may still be configuring."""
+        if not self.power.refresh_toggle:
+            return False
+        if self.power.apply_refresh_rate():
+            self._cached_refresh_hz = get_current_refresh_rate()
+            return False  # success, stop retrying
+        self._refresh_retries = getattr(self, "_refresh_retries", 0) + 1
+        if self._refresh_retries >= 5:
+            return False  # give up
+        return True  # retry in 3 seconds
 
     def _write_status_file(self, data):
         """Write latest UPS data to a JSON file for external consumers."""
