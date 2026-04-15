@@ -1021,34 +1021,32 @@ class BatterySettingsWindow(Gtk.Window):
         notebook = Gtk.Notebook()
         outer.pack_start(notebook, True, True, 4)
 
-        # ═══ TAB 1: Settings ═══
-        settings_page = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        # ═══ TAB 1: UPS ═══
+        ups_page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=6
         )
-        settings_page.set_margin_start(8)
-        settings_page.set_margin_end(8)
-        settings_page.set_margin_top(8)
-        settings_page.set_margin_bottom(8)
-        notebook.append_page(settings_page, Gtk.Label(label="Settings"))
+        ups_page.set_margin_start(8)
+        ups_page.set_margin_end(8)
+        ups_page.set_margin_top(8)
+        ups_page.set_margin_bottom(8)
+        notebook.append_page(ups_page, Gtk.Label(label="UPS"))
 
-        # UPS Info
-        info_frame = Gtk.Frame(label="  UPS Information  ")
-        info_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
-        info_grid.set_margin_start(12)
-        info_grid.set_margin_end(12)
-        info_grid.set_margin_top(6)
-        info_grid.set_margin_bottom(6)
+        hw = self.backend.get_hardware_info() if self.backend else {}
+        ups_type = d.get("ups_type", "")
+
+        # Status
+        st_frame = Gtk.Frame(label="  Status  ")
+        st_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
+        st_grid.set_margin_start(12)
+        st_grid.set_margin_end(12)
+        st_grid.set_margin_top(4)
+        st_grid.set_margin_bottom(4)
 
         row = 0
-        self._add_info_row(info_grid, row, "UPS Type:",
-                           d.get("ups_version", "—"))
-        row += 1
-
-        # PiPower5: compact multi-value rows
-        if d.get("ups_type") == "pipower5":
+        if ups_type == "pipower5":
             in_v = d.get("input_voltage_mv")
             in_w = d.get("input_power_w")
-            self._add_info_row(info_grid, row, "Input:",
+            self._add_info_row(st_grid, row, "Input:",
                                f"{in_v / 1000.0:.1f} V, "
                                f"{d.get('input_current_ma', 0)} mA"
                                f" ({in_w:.1f} W)"
@@ -1056,7 +1054,7 @@ class BatterySettingsWindow(Gtk.Window):
             row += 1
             out_v = d.get("vout_volts", 0)
             out_w = d.get("output_power_w")
-            self._add_info_row(info_grid, row, "Output:",
+            self._add_info_row(st_grid, row, "Output:",
                                f"{out_v:.2f} V, "
                                f"{d.get('output_current_ma', 0)} mA"
                                f" ({out_w:.1f} W)"
@@ -1065,31 +1063,34 @@ class BatterySettingsWindow(Gtk.Window):
             bat_v = d.get("battery_voltage_mv")
             rt = d.get("estimated_runtime_min")
             rt_str = f", ~{rt} min" if rt else ""
-            self._add_info_row(info_grid, row, "Battery:",
+            self._add_info_row(st_grid, row, "Battery:",
                                f"{bat_v / 1000.0:.2f} V, "
                                f"{d.get('battery_current_ma', 0)} mA"
                                f"{rt_str}"
                                if bat_v else "—")
         else:
-            # V3P: just output voltage
-            self._add_info_row(info_grid, row, "Output Voltage:",
+            self._add_info_row(st_grid, row, "Model:",
+                               d.get("ups_version", "—"))
+            row += 1
+            self._add_info_row(st_grid, row, "Output:",
                                f"{d.get('vout_volts', 0):.2f} V"
                                if d.get("vout_volts") else "—")
 
-        info_frame.add(info_grid)
-        settings_page.pack_start(info_frame, False, False, 0)
+        st_frame.add(st_grid)
+        ups_page.pack_start(st_frame, False, False, 0)
 
-        # Shutdown
-        sd_frame = Gtk.Frame(label="  Low Battery Shutdown  ")
-        sd_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        # Shutdown & Warnings (merged)
+        sd_frame = Gtk.Frame(label="  Shutdown & Warnings  ")
+        sd_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
         sd_grid.set_margin_start(12)
         sd_grid.set_margin_end(12)
-        sd_grid.set_margin_top(6)
-        sd_grid.set_margin_bottom(6)
+        sd_grid.set_margin_top(4)
+        sd_grid.set_margin_bottom(4)
 
         sd = self.cfg.get("shutdown", {})
+        nf = self.cfg.get("notifications", {})
 
-        self.sd_enable = Gtk.CheckButton(label="Enable auto-shutdown")
+        self.sd_enable = Gtk.CheckButton(label="Auto-shutdown on low battery")
         self.sd_enable.set_active(sd.get("enable", True))
         sd_grid.attach(self.sd_enable, 0, 0, 2, 1)
 
@@ -1112,120 +1113,68 @@ class BatterySettingsWindow(Gtk.Window):
         sd_grid.attach(confirm_box, 1, 2, 1, 1)
 
         self.sd_reboot = Gtk.CheckButton(label="Reboot instead of shutdown")
-        self.sd_reboot.set_tooltip_text(
-            "Reboot allows the Pi to restart automatically\n"
-            "when AC power returns after a low battery shutdown.")
         self.sd_reboot.set_active(
             "shutdown -r" in sd.get("command", "")
         )
         sd_grid.attach(self.sd_reboot, 0, 3, 2, 1)
 
-        sd_frame.add(sd_grid)
-        settings_page.pack_start(sd_frame, False, False, 0)
-
-        # Notifications
-        nf_frame = Gtk.Frame(label="  Notifications  ")
-        nf_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
-        nf_grid.set_margin_start(12)
-        nf_grid.set_margin_end(12)
-        nf_grid.set_margin_top(6)
-        nf_grid.set_margin_bottom(6)
-
-        nf = self.cfg.get("notifications", {})
-
-        self.nf_enable = Gtk.CheckButton(label="Enable low battery warning")
+        self.nf_enable = Gtk.CheckButton(label="Low battery warning")
         self.nf_enable.set_active(nf.get("enable", True))
-        nf_grid.attach(self.nf_enable, 0, 0, 2, 1)
-
-        nf_grid.attach(Gtk.Label(label="Warn at:", xalign=0), 0, 1, 1, 1)
+        sd_grid.attach(self.nf_enable, 0, 4, 1, 1)
         self.nf_warn = Gtk.SpinButton.new_with_range(1, 50, 1)
         self.nf_warn.set_value(nf.get("warn_percent", 20))
         warn_box = Gtk.Box(spacing=4)
         warn_box.pack_start(self.nf_warn, False, False, 0)
         warn_box.pack_start(Gtk.Label(label="%"), False, False, 0)
-        nf_grid.attach(warn_box, 1, 1, 1, 1)
+        sd_grid.attach(warn_box, 1, 4, 1, 1)
 
-        nf_frame.add(nf_grid)
-        settings_page.pack_start(nf_frame, False, False, 0)
+        sd_frame.add(sd_grid)
+        ups_page.pack_start(sd_frame, False, False, 0)
 
-        # ═══ TAB 2: UPS ═══
-        ups_page = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8
-        )
-        ups_page.set_margin_start(8)
-        ups_page.set_margin_end(8)
-        ups_page.set_margin_top(8)
-        ups_page.set_margin_bottom(8)
-        notebook.append_page(ups_page, Gtk.Label(label="UPS"))
-
-        hw = self.backend.get_hardware_info() if self.backend else {}
-        ups_type = d.get("ups_type", "")
-
+        # Hardware / Connection
         if ups_type == "pipower5":
-            # Battery capacity
-            cap_frame = Gtk.Frame(label="  Battery  ")
-            cap_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
-            cap_grid.set_margin_start(12)
-            cap_grid.set_margin_end(12)
-            cap_grid.set_margin_top(6)
-            cap_grid.set_margin_bottom(6)
+            hw_frame = Gtk.Frame(label="  Hardware  ")
+            hw_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
+            hw_grid.set_margin_start(12)
+            hw_grid.set_margin_end(12)
+            hw_grid.set_margin_top(4)
+            hw_grid.set_margin_bottom(4)
 
-            cap_grid.attach(
+            hw_grid.attach(
                 Gtk.Label(label="Capacity:", xalign=0), 0, 0, 1, 1
             )
             pp = self.cfg.get("pipower5", {})
-            self.ups_capacity = Gtk.SpinButton.new_with_range(1, 200, 0.1)
+            self.ups_capacity = Gtk.SpinButton.new_with_range(
+                1, 200, 0.1
+            )
             self.ups_capacity.set_digits(1)
             self.ups_capacity.set_value(
                 float(pp.get("battery_capacity_wh", 59.2))
             )
             cap_box = Gtk.Box(spacing=4)
             cap_box.pack_start(self.ups_capacity, False, False, 0)
-            cap_box.pack_start(
-                Gtk.Label(label="Wh"), False, False, 0
-            )
-            cap_grid.attach(cap_box, 1, 0, 1, 1)
+            cap_box.pack_start(Gtk.Label(label="Wh"), False, False, 0)
+            hw_grid.attach(cap_box, 1, 0, 1, 1)
 
-            hint = Gtk.Label(xalign=0)
-            hint.set_markup(
-                "<small>Used for runtime estimation. "
-                "See README for calibration.</small>"
-            )
-            cap_grid.attach(hint, 0, 1, 2, 1)
-
-            cap_frame.add(cap_grid)
-            ups_page.pack_start(cap_frame, False, False, 0)
-
-            # Hardware info
-            hw_frame = Gtk.Frame(label="  Hardware  ")
-            hw_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
-            hw_grid.set_margin_start(12)
-            hw_grid.set_margin_end(12)
-            hw_grid.set_margin_top(6)
-            hw_grid.set_margin_bottom(6)
-
-            self._add_info_row(hw_grid, 0, "Firmware:",
-                               hw.get("firmware", "—"))
-            self._add_info_row(hw_grid, 1, "Shutdown at:",
-                               f"{hw.get('shutdown_pct', '—')}%"
-                               if "shutdown_pct" in hw else "—")
-            self._add_info_row(hw_grid, 2, "Max charge:",
-                               f"{hw.get('max_charge_ma', '—')} mA"
-                               if "max_charge_ma" in hw else "—")
-            self._add_info_row(hw_grid, 3, "Default on:",
-                               "on" if hw.get("default_on") else "off")
+            # Compact hardware info on two rows
+            fw = hw.get("firmware", "—")
+            sd_pct = hw.get("shutdown_pct", "—")
+            self._add_info_row(hw_grid, 1, "Firmware:",
+                               f"{fw}    Shutdown: {sd_pct}%")
+            charge = hw.get("max_charge_ma", "—")
+            default = "on" if hw.get("default_on") else "off"
+            self._add_info_row(hw_grid, 2, "Charge:",
+                               f"{charge} mA    Default on: {default}")
 
             hw_frame.add(hw_grid)
             ups_page.pack_start(hw_frame, False, False, 0)
-
         else:
-            # V3P: connection settings
             conn_frame = Gtk.Frame(label="  Connection  ")
-            conn_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+            conn_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
             conn_grid.set_margin_start(12)
             conn_grid.set_margin_end(12)
-            conn_grid.set_margin_top(6)
-            conn_grid.set_margin_bottom(6)
+            conn_grid.set_margin_top(4)
+            conn_grid.set_margin_bottom(4)
 
             conn_grid.attach(
                 Gtk.Label(label="Serial port:", xalign=0), 0, 0, 1, 1
@@ -1241,19 +1190,12 @@ class BatterySettingsWindow(Gtk.Window):
                 str(hw.get("baud", 9600))
             )
 
-            hint = Gtk.Label(xalign=0)
-            hint.set_markup(
-                "<small>Changes require restarting "
-                "battery-monitor.</small>"
-            )
-            conn_grid.attach(hint, 0, 2, 2, 1)
-
             conn_frame.add(conn_grid)
             ups_page.pack_start(conn_frame, False, False, 0)
 
-        # ═══ TAB 3: Power Saver ═══
+        # ═══ TAB 2: Power Saver ═══
         power_page = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8
+            orientation=Gtk.Orientation.VERTICAL, spacing=6
         )
         power_page.set_margin_start(8)
         power_page.set_margin_end(8)
@@ -1265,11 +1207,11 @@ class BatterySettingsWindow(Gtk.Window):
 
         # On Battery
         bat_frame = Gtk.Frame(label="  On Battery  ")
-        bat_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        bat_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
         bat_grid.set_margin_start(12)
         bat_grid.set_margin_end(12)
-        bat_grid.set_margin_top(6)
-        bat_grid.set_margin_bottom(6)
+        bat_grid.set_margin_top(4)
+        bat_grid.set_margin_bottom(4)
 
         self.ps_cpu = Gtk.CheckButton(
             label="Switch CPU to power saving on battery"
@@ -1294,11 +1236,11 @@ class BatterySettingsWindow(Gtk.Window):
 
         # CPU Frequency
         freq_frame = Gtk.Frame(label="  CPU Frequency  ")
-        freq_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        freq_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
         freq_grid.set_margin_start(12)
         freq_grid.set_margin_end(12)
-        freq_grid.set_margin_top(6)
-        freq_grid.set_margin_bottom(6)
+        freq_grid.set_margin_top(4)
+        freq_grid.set_margin_bottom(4)
 
         avail = get_available_frequencies()
         avail_mhz = [freq_khz_to_mhz(f) for f in avail] if avail else []
@@ -1338,7 +1280,8 @@ class BatterySettingsWindow(Gtk.Window):
         freq_grid.attach(self.freq_bat_combo, 1, 1, 1, 1)
 
         # Live CPU status
-        freq_grid.attach(Gtk.Label(label="Current:", xalign=0), 0, 2, 1, 1)
+        freq_grid.attach(Gtk.Label(label="Current:", xalign=0),
+                         0, 2, 1, 1)
         self._freq_label = Gtk.Label(xalign=0)
         self._update_freq_label()
         freq_grid.attach(self._freq_label, 1, 2, 1, 1)
@@ -1348,11 +1291,11 @@ class BatterySettingsWindow(Gtk.Window):
 
         # Display
         disp_frame = Gtk.Frame(label="  Display  ")
-        disp_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+        disp_grid = Gtk.Grid(column_spacing=12, row_spacing=2)
         disp_grid.set_margin_start(12)
         disp_grid.set_margin_end(12)
-        disp_grid.set_margin_top(6)
-        disp_grid.set_margin_bottom(6)
+        disp_grid.set_margin_top(4)
+        disp_grid.set_margin_bottom(4)
 
         self.ps_refresh = Gtk.CheckButton(
             label="Reduce refresh rate (60→30 Hz)"
