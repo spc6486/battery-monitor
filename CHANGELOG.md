@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.0
+
+- **Dual UPS support:** auto-detects SunFounder PiPower 5 (I2C) or MakerFocus V3/V3P (UART)
+- Backend abstraction: `UPSBackend` base class with `V3PBackend` and `PiPower5Backend`
+- PiPower 5 provides: input/output/battery voltage and current, power draw,
+  charge state, and estimated runtime
+- Predictive runtime estimation (PiPower 5 only, rolling 30-sample power average)
+- PiPower 5 `shutdown_request` register honored immediately
+- Settings window adapts to show backend-specific information
+- CLI shows UPS type, connection info, and PiPower 5 power/runtime data
+- Status file extended with PiPower 5 fields (V3P fields remain for backward compat)
+- Installer adds `smbus2` dependency (apt with pip fallback)
+- Battery capacity (Wh) configurable for runtime estimation accuracy
+- UPS settings tab: battery capacity (PiPower 5) or serial port (V3P)
+- PiPower 5 hardware info display: firmware, shutdown %, charge current
+- Installer removes wf-panel-pi `batt` widget (shows 0% with PiPower 5)
+- Installer suppresses pipower5.service (re-enabled on uninstall)
+- Refresh rate change includes safety revert (auto-recovers if display goes dark)
+
 ## 1.1.1
 
 - Refresh rate is now persistent — set once at startup and on Apply, no toggling

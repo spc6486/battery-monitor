@@ -1,9 +1,12 @@
 # Battery Monitor
 
-System tray indicator for the MakerFocus UPSPack V3/V3P on Raspberry Pi.
+System tray indicator for UPS battery monitoring on Raspberry Pi.
+Supports SunFounder PiPower 5 (I2C) and MakerFocus V3/V3P (UART) with
+automatic hardware detection.
 
 ## Features
 
+- **Dual UPS support** — auto-detects PiPower 5 or V3/V3P at startup
 - **Tray icon** with standard battery icons (charging/discharging/full/low)
 - **Auto-shutdown** with configurable threshold and hysteresis
 - **Low battery notification** at configurable warning level
@@ -11,48 +14,35 @@ System tray indicator for the MakerFocus UPSPack V3/V3P on Raspberry Pi.
 - **CLI mode** for headless/SSH monitoring
 - **Power saver** — independently toggle CPU governor, frequency cap, Bluetooth, Wi-Fi, and refresh rate on battery
 - **Dynamic CPU capping** — set separate max CPU frequencies for AC and battery
-- **Refresh rate switching** — drops HDMI from 60Hz to 30Hz on battery for power/thermal savings
+- **Refresh rate switching** — drops HDMI from 60Hz to 30Hz for power/thermal savings
 - **Live CPU monitoring** — real-time frequency display in the settings window
+- **Predictive runtime** — estimated remaining runtime (PiPower 5 only)
 - **Optional MQTT** publishing (disabled by default)
 - **Single process** — no MQTT broker required for basic operation
-- **Pi 5 UART** setup handled automatically by installer
 
 ## Compatibility
 
-### UPS
+### Supported UPS Hardware
 
-This monitor supports the **MakerFocus UPSPack V3 and V3P** only. These use
-a text-based UART protocol at 9600 8N1:
+| UPS | Connection | Data Available |
+|-----|-----------|----------------|
+| SunFounder PiPower 5 | I2C (GPIO2/3, addr 0x5C) | Voltage, current, power (in/out/bat), SOC%, runtime est. |
+| MakerFocus V3/V3P | UART (GPIO14/15, 9600 8N1) | SOC%, AC status, output voltage |
 
-```
-$ SmartUPS V3.2P,Vin GOOD,BATCAP 48,Vout 5250 $
-```
-
-Other UPS boards (Geekworm, Waveshare, PiSugar, CyberPower, APC) use
-different protocols or I2C and are not supported.
+The app auto-detects which hardware is present — no manual configuration needed.
 
 ### Raspberry Pi
 
-| Model | Status | UART Setup |
-|-------|--------|------------|
-| Pi 5 | Tested | `dtparam=uart0=on` (auto) |
-| Pi 4 / Pi 400 | Supported | PL011 already on GPIO14/15 |
-| Pi 3 / Zero 2 W | Supported | `dtoverlay=disable-bt` (auto, disables Bluetooth) |
+| Model | Status | Notes |
+|-------|--------|-------|
+| Pi 5 | Tested | UART auto-configured for V3P |
+| Pi 4 / Pi 400 | Supported | PL011 on GPIO14/15 for V3P |
+| Pi 3 / Zero 2 W | Supported | Disables Bluetooth overlay for V3P UART |
 | Pi Zero / Pi 2 / older | Untested | May need manual UART configuration |
-
-The installer auto-detects the Pi model and applies the correct UART
-configuration. On Pi 3 and Zero 2 W, the installer disables the Bluetooth
-overlay to free the PL011 UART for the UPS — Bluetooth will not be available.
 
 ### Operating System
 
 Requires Raspberry Pi OS Bookworm (or later) with a GUI desktop.
-
-## Hardware
-
-- MakerFocus RPi V3P UPS on UART (GPIO14/15, /dev/ttyAMA0)
-- Protocol: `$ SmartUPS V3.2P,Vin GOOD,BATCAP 48,Vout 5250 $` at 9600 8N1
-- Wiring: UPS TX → Pi RXD0 (pin 10), UPS RX → Pi TXD0 (pin 8), GND → GND
 
 ## Install
 
@@ -63,14 +53,14 @@ cd battery-monitor
 ```
 
 The installer will:
-1. Install system packages (python3-gi, python3-serial, etc.)
-2. Configure UART for your Pi model (auto-detected)
-3. Disable serial console on UART0
+1. Install system packages (python3-gi, python3-serial, smbus2, etc.)
+2. Configure UART for your Pi model (auto-detected, for V3P support)
+3. Optionally enable extended CPU frequency range (arm_freq_min=600)
 4. Install to `/opt/battery-monitor/`
 5. Create CLI launcher (`battery-monitor`)
 6. Set up autostart on login
 7. Configure passwordless shutdown
-8. Prompt to reboot if UART changes were made
+8. Prompt to reboot if config.txt changes were made
 
 ## Usage
 
@@ -98,7 +88,9 @@ Prints live UPS data to terminal — useful over SSH.
 Click the tray icon → **Battery Settings…** to open the settings window.
 
 **Settings tab:**
-- UPS model and output voltage
+- UPS type, model, and output voltage
+- Input/output voltage, current, and power (PiPower 5)
+- Estimated runtime (PiPower 5)
 - Shutdown threshold and confirm delay
 - Low battery warning level
 
@@ -153,6 +145,11 @@ power_saver:
   max_freq_ac: 0         # CPU max kHz on AC (0 = hardware max)
   max_freq_battery: 0    # CPU max kHz on battery (0 = hardware max)
   disable_bluetooth: false  # rfkill bluetooth on battery
+  disable_wifi: false       # rfkill wifi on battery
+  reduce_refresh_rate: false # HDMI 60→30 Hz
+
+pipower5:
+  battery_capacity_wh: 59.2  # For runtime estimation
 
 mqtt:
   enable: false          # Set true to publish to MQTT
@@ -165,10 +162,9 @@ mqtt:
 Changes made via the Settings dialog are saved automatically.
 Manual edits take effect after restarting the tray.
 
+### Changing the serial port (V3P only)
 
-### Changing the serial port
-
-The default port `/dev/ttyAMA0` is correct for a Pi 5 with the UPS wired to
+The default port `/dev/ttyAMA0` is correct for a Pi 5 with the V3P wired to
 GPIO14/15. If using a USB-serial adapter, edit the config file:
 
 ```bash
@@ -176,6 +172,25 @@ sudo nano /etc/battery-monitor/battery.conf
 ```
 
 Change `port:` to `/dev/ttyUSB0` (or whichever device), then restart the tray.
+PiPower 5 users do not need to configure a serial port.
+
+### Battery capacity calibration (PiPower 5)
+
+The runtime estimate depends on the `battery_capacity_wh` setting in the
+UPS tab. The default is 59.2 Wh (two 10Ah MakerFocus packs in 2S at 7.4V,
+derated to ~80% usable). To calibrate for your actual packs:
+
+1. Fully charge the battery
+2. Disconnect external power and use the device normally
+3. Note the runtime and average output power shown in the tray or CLI
+4. When the device shuts down, calculate: `capacity = runtime_hours × average_watts`
+5. Enter the result in Battery Settings → UPS → Capacity
+
+For example, if the device ran for 3.5 hours at an average of 10W:
+`3.5 × 10 = 35 Wh`
+
+Battery capacity decreases with age, temperature, and charge cycles.
+Re-calibrate periodically for accurate estimates.
 
 ## File Locations
 

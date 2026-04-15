@@ -92,6 +92,20 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "remove" ]; then
     ok "Battery Monitor removed."
     echo "   UART settings in /boot/firmware/config.txt are preserved."
     echo "   Sudoers shutdown rule removed."
+
+    # Re-enable pipower5 if it was disabled by us
+    if [ -f /etc/xdg/autostart/pipower5.desktop.disabled ]; then
+        sudo mv /etc/xdg/autostart/pipower5.desktop.disabled \
+            /etc/xdg/autostart/pipower5.desktop 2>/dev/null || true
+        echo "   pipower5 autostart re-enabled."
+    fi
+    if systemctl is-enabled pipower5.service &>/dev/null; then
+        : # already enabled
+    elif systemctl list-unit-files pipower5.service &>/dev/null 2>&1; then
+        sudo systemctl enable pipower5.service 2>/dev/null || true
+        echo "   pipower5.service re-enabled."
+    fi
+
     echo ""
     exit 0
 fi
@@ -118,11 +132,18 @@ sudo apt-get install -y -qq \
     python3-gi \
     python3-serial \
     python3-yaml \
+    python3-smbus2 \
+    i2c-tools \
     gir1.2-gtk-3.0 \
     gir1.2-ayatanaappindicator3-0.1 \
     libayatana-appindicator3-1 \
     libnotify-bin \
     > /dev/null 2>&1
+
+# Fallback: install smbus2 via pip if apt package unavailable
+if ! python3 -c "import smbus2" 2>/dev/null; then
+    pip3 install smbus2 --break-system-packages -q 2>/dev/null || true
+fi
 ok "System packages installed"
 
 # ── 2. Detect Pi model and configure UART ────────────────
@@ -202,12 +223,37 @@ if [ -f "$CMDLINE" ]; then
     fi
 fi
 
-# Add user to dialout group
+# Add user to dialout group (for V3P UART)
 if ! groups "$USER_REAL" | grep -q dialout; then
     info "Adding $USER_REAL to dialout group..."
     sudo usermod -a -G dialout "$USER_REAL"
     ok "Added to dialout group"
     NEED_REBOOT=1
+fi
+
+# Add user to i2c group (for PiPower 5)
+if ! groups "$USER_REAL" | grep -q i2c; then
+    info "Adding $USER_REAL to i2c group..."
+    sudo usermod -a -G i2c "$USER_REAL"
+    ok "Added to i2c group"
+    NEED_REBOOT=1
+fi
+
+# Enable I2C (for PiPower 5 support)
+if [ -f "$BOOT_CFG" ]; then
+    if ! grep -q '^dtparam=i2c_arm=on' "$BOOT_CFG" 2>/dev/null; then
+        # raspi-config is the preferred method
+        if command -v raspi-config &>/dev/null; then
+            sudo raspi-config nonint do_i2c 0 2>/dev/null || true
+            ok "I2C enabled via raspi-config"
+        else
+            echo 'dtparam=i2c_arm=on' | sudo tee -a "$BOOT_CFG" > /dev/null
+            ok "I2C enabled in config.txt"
+        fi
+        NEED_REBOOT=1
+    else
+        ok "I2C already enabled"
+    fi
 fi
 
 # ── 2b. Extended CPU frequency range ────────────────────
@@ -355,6 +401,9 @@ power_saver:
   disable_wifi: false
   reduce_refresh_rate: false
 
+pipower5:
+  battery_capacity_wh: 59.2
+
 mqtt:
   enable: false
   host: 127.0.0.1
@@ -363,12 +412,58 @@ mqtt:
   client_id: rp5-ups
 CONF
     sudo chmod 644 "$CONFIG_FILE"
+    sudo chown "$USER_REAL:$USER_REAL" "$CONFIG_DIR" "$CONFIG_FILE"
     ok "Config: $CONFIG_FILE"
 else
     ok "Existing config preserved: $CONFIG_FILE"
+    # Ensure user can write to config
+    sudo chown "$USER_REAL:$USER_REAL" "$CONFIG_DIR" "$CONFIG_FILE"
 fi
 
-# ── 10. Passwordless shutdown ────────────────────────────
+# ── 10. Suppress pipower5 tray/service ───────────────────
+
+# battery-monitor supersedes pipower5's monitoring. Disable its service
+# to avoid duplicate tray icons and conflicting shutdown handling.
+if systemctl is-active --quiet pipower5.service 2>/dev/null; then
+    info "Disabling pipower5 service (superseded by battery-monitor)..."
+    sudo systemctl stop pipower5.service 2>/dev/null || true
+    sudo systemctl disable pipower5.service 2>/dev/null || true
+    ok "pipower5.service disabled"
+elif systemctl is-enabled --quiet pipower5.service 2>/dev/null; then
+    info "Disabling pipower5 service (superseded by battery-monitor)..."
+    sudo systemctl disable pipower5.service 2>/dev/null || true
+    ok "pipower5.service disabled"
+fi
+# Remove pipower5 autostart (system-wide)
+if [ -f /etc/xdg/autostart/pipower5.desktop ]; then
+    sudo mv /etc/xdg/autostart/pipower5.desktop \
+        /etc/xdg/autostart/pipower5.desktop.disabled 2>/dev/null || true
+    ok "pipower5 system autostart disabled"
+fi
+# Remove pipower5 autostart (user-level)
+for userdir in /home/*/; do
+    if [ -f "${userdir}.config/autostart/pipower5.desktop" ]; then
+        mv "${userdir}.config/autostart/pipower5.desktop" \
+            "${userdir}.config/autostart/pipower5.desktop.disabled" 2>/dev/null || true
+        ok "pipower5 user autostart disabled for $(basename "$userdir")"
+    fi
+done
+# Stop any running pipower5 processes
+pkill -f "pipower5" 2>/dev/null || true
+
+# ── 11. Suppress panel battery widget ────────────────────
+
+# wf-panel-pi's built-in 'batt' widget reads /sys/class/power_supply/
+# which PiPower5 doesn't register with — shows 0%. Remove it since
+# battery-monitor's tray icon handles battery display.
+PANEL_CFG="$(eval echo ~"$USER_REAL")/.config/wf-panel-pi.ini"
+if [ -f "$PANEL_CFG" ] && grep -q ' batt' "$PANEL_CFG"; then
+    sed -i 's/ batt spacing[0-9]*//' "$PANEL_CFG"
+    sed -i 's/ batt//' "$PANEL_CFG"
+    ok "Panel battery widget removed (battery-monitor tray replaces it)"
+fi
+
+# ── 12. Passwordless shutdown ────────────────────────────
 
 info "Configuring passwordless shutdown..."
 echo "$USER_REAL ALL=(ALL) NOPASSWD: /sbin/shutdown" | \
@@ -381,7 +476,7 @@ ok "Sudoers rule: $SUDOERS_FILE"
 # Remove old-style sudoers if present
 sudo rm -f /etc/sudoers.d/pi-shutdown 2>/dev/null || true
 
-# ── 11. Update icon cache ───────────────────────────────
+# ── 13. Update icon cache ───────────────────────────────
 
 if command -v gtk-update-icon-cache &>/dev/null; then
     sudo gtk-update-icon-cache -f /usr/share/icons/hicolor/ 2>/dev/null || true

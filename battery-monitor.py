@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Battery Monitor — MakerFocus UPSPack V3/V3P tray indicator for Raspberry Pi.
+Battery Monitor — UPS tray indicator for Raspberry Pi.
 
-Single-process design: reads UART directly, drives the tray icon,
-handles low-battery shutdown. No MQTT required.
+Supports both SunFounder PiPower 5 (I2C) and MakerFocus V3/V3P (UART).
+Auto-detects which hardware is present at startup.
 
 Install location: /opt/battery-monitor/
 Config location:  /etc/battery-monitor/battery.conf
@@ -18,6 +18,7 @@ import json
 import threading
 import subprocess
 import signal
+import collections
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -35,6 +36,11 @@ except ImportError:
     serial = None
 
 try:
+    import smbus2
+except ImportError:
+    smbus2 = None
+
+try:
     import yaml
 except ImportError:
     yaml = None
@@ -45,15 +51,14 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 
 APP_ID = "battery-monitor"
-VERSION = "1.1.1"
+VERSION = "2.0.0"
 CONFIG_PATH = "/etc/battery-monitor/battery.conf"
 
 # Status file for external consumers (e.g. serial bridge)
-# Written each poll cycle with latest UPS data as JSON
 _runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 STATUS_FILE = os.path.join(_runtime, "battery-monitor-status.json")
 
-# UPS protocol parsing
+# V3P protocol parsing
 LINE_PAT = re.compile(
     r"(?i)\$?\s*SmartUPS\s+([^,]+),\s*Vin\s+(\w+)\s*,"
     r"\s*BATCAP\s+(\d+)\s*,\s*Vout\s+(\d+)"
@@ -61,6 +66,10 @@ LINE_PAT = re.compile(
 
 VIN_AC = {"GOOD", "OK"}
 VIN_BAT = {"NG", "BAD"}
+
+# PiPower 5 I2C
+PIPOWER5_ADDR = 0x5C
+PIPOWER5_BUS = 1
 
 # sysfs paths
 GOVERNOR_PATH = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
@@ -97,6 +106,9 @@ DEFAULT_CONFIG = {
         "disable_wifi": False,
         "reduce_refresh_rate": False,
     },
+    "pipower5": {
+        "battery_capacity_wh": 59.2,
+    },
     "mqtt": {
         "enable": False,
         "host": "127.0.0.1",
@@ -108,45 +120,42 @@ DEFAULT_CONFIG = {
 
 
 # ═══════════════════════════════════════════════════════════════
-# Configuration
+# Config Management
 # ═══════════════════════════════════════════════════════════════
 
 def load_config():
-    """Load config from file, falling back to defaults."""
     cfg = _deep_copy(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                if yaml:
-                    user = yaml.safe_load(f) or {}
-                else:
-                    user = json.load(f)
-                _deep_merge(cfg, user)
-        except Exception as e:
-            print(f"Warning: could not read {CONFIG_PATH}: {e}",
-                  file=sys.stderr)
+    if not os.path.exists(CONFIG_PATH):
+        return cfg
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            if yaml:
+                user = yaml.safe_load(f) or {}
+            else:
+                user = {}
+                for line in f:
+                    line = line.strip()
+                    if ":" in line and not line.startswith("#"):
+                        k, v = line.split(":", 1)
+                        user[k.strip()] = v.strip()
+        _deep_merge(cfg, user)
+    except Exception as e:
+        print(f"Config load error: {e}", file=sys.stderr)
     return cfg
 
 
 def save_config(cfg):
-    """Write config back to file."""
-    conf_dir = os.path.dirname(CONFIG_PATH)
+    if not yaml:
+        return False
     try:
-        if not os.path.exists(conf_dir):
-            subprocess.run(["sudo", "mkdir", "-p", conf_dir], check=True)
-        tmp = f"/tmp/{APP_ID}-conf-{os.getpid()}.tmp"
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w") as f:
-            if yaml:
-                yaml.safe_dump(cfg, f, sort_keys=False,
-                               default_flow_style=False)
-            else:
-                json.dump(cfg, f, indent=2)
-        subprocess.run(["sudo", "cp", tmp, CONFIG_PATH], check=True)
-        subprocess.run(["sudo", "chmod", "644", CONFIG_PATH], check=True)
-        os.unlink(tmp)
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, CONFIG_PATH)
         return True
     except Exception as e:
-        print(f"Error saving config: {e}", file=sys.stderr)
+        print(f"Config save error: {e}", file=sys.stderr)
         return False
 
 
@@ -156,28 +165,25 @@ def _deep_copy(d):
 
 def _deep_merge(base, override):
     for k, v in override.items():
-        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
             _deep_merge(base[k], v)
         else:
             base[k] = v
 
 
 # ═══════════════════════════════════════════════════════════════
-# CPU Frequency Detection
+# CPU Frequency Helpers
 # ═══════════════════════════════════════════════════════════════
 
 def get_available_frequencies():
-    """Return sorted list of available CPU frequencies in kHz."""
     try:
         with open(AVAIL_FREQ_PATH, "r") as f:
-            freqs = [int(x) for x in f.read().strip().split()]
-            return sorted(freqs)
+            return sorted(int(x) for x in f.read().split())
     except Exception:
         return []
 
 
 def get_current_max_freq():
-    """Read current scaling_max_freq in kHz."""
     try:
         with open(MAX_FREQ_PATH, "r") as f:
             return int(f.read().strip())
@@ -186,7 +192,6 @@ def get_current_max_freq():
 
 
 def get_current_freq():
-    """Read current CPU frequency in kHz."""
     try:
         with open(CUR_FREQ_PATH, "r") as f:
             return int(f.read().strip())
@@ -195,12 +200,10 @@ def get_current_freq():
 
 
 def freq_khz_to_mhz(khz):
-    """Convert kHz to MHz for display."""
     return khz // 1000
 
 
 def freq_mhz_to_khz(mhz):
-    """Convert MHz to kHz for sysfs."""
     return mhz * 1000
 
 
@@ -219,6 +222,26 @@ def detect_hdmi_output():
             line = line.strip()
             if line.startswith("HDMI-"):
                 return line.split()[0]
+    except Exception:
+        pass
+    return None
+
+
+def get_display_description():
+    """Get the full display description string from wlr-randr.
+    Returns e.g. 'XXX HDMI' or 'TYT HDMI HDMI', or None."""
+    try:
+        out = subprocess.check_output(
+            ["wlr-randr"], text=True, timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("HDMI-"):
+                # Format: HDMI-A-1 "Description (HDMI-A-1)"
+                m = re.match(r'HDMI-\S+\s+"([^"]+)"', line)
+                if m:
+                    return m.group(1)
     except Exception:
         pass
     return None
@@ -243,13 +266,13 @@ def get_current_refresh_rate():
 
 def set_refresh_rate(hz):
     """Set HDMI refresh rate via wlr-randr custom mode.
-    Returns True on success. Does NOT modify kanshi config
-    (custom modes aren't in EDID and would break kanshi)."""
+    Returns True on success. Does NOT verify display health —
+    caller should use confirm_or_revert_refresh() for user-initiated changes."""
     current_hz = get_current_refresh_rate()
     if current_hz == hz:
         return True
     if current_hz == 0:
-        return False  # compositor not ready
+        return False
     output = detect_hdmi_output()
     if not output:
         return False
@@ -279,12 +302,92 @@ def set_refresh_rate(hz):
         return False
 
 
+def revert_refresh_rate():
+    """Revert display to EDID default by restarting kanshi."""
+    try:
+        subprocess.run(["pkill", "kanshi"],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        subprocess.Popen(["kanshi"],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════
-# UPS Serial Reader
+# UPS Backend Abstraction
 # ═══════════════════════════════════════════════════════════════
 
-class UPSReader:
-    """Reads MakerFocus V3P UPS data from UART."""
+def detect_ups_type():
+    """Detect which UPS hardware is present. Returns 'pipower5', 'v3p', or None."""
+    # Try I2C first (PiPower 5) — read status block and verify sane values
+    if smbus2:
+        try:
+            bus = smbus2.SMBus(PIPOWER5_BUS)
+            # Read 25-byte status block from register 0 (matches SPC read_all)
+            raw = bus.read_i2c_block_data(PIPOWER5_ADDR, 0, 25)
+            bus.close()
+            # Output voltage at offset 4 (little-endian word)
+            out_mv = raw[4] | (raw[5] << 8)
+            # Battery percentage at offset 12 (single byte)
+            pct = raw[12]
+            # Sanity: output voltage 3000-6000 mV and percent 0-100
+            if 3000 <= out_mv <= 6000 and 0 <= pct <= 100:
+                return "pipower5"
+        except Exception:
+            pass
+    # Try UART (V3P)
+    if serial:
+        try:
+            ports = ["/dev/ttyAMA0", "/dev/serial0"]
+            for port in ports:
+                if os.path.exists(port):
+                    ser = serial.Serial(port, 9600, timeout=2)
+                    data = ser.read(200)
+                    ser.close()
+                    if b"SmartUPS" in data:
+                        return "v3p"
+        except Exception:
+            pass
+    return None
+
+
+class UPSBackend:
+    """Abstract base for UPS communication backends."""
+
+    def open(self):
+        """Open the connection. Returns True on success."""
+        raise NotImplementedError
+
+    def close(self):
+        """Close the connection."""
+        pass
+
+    def is_connected(self):
+        """Returns True if backend is connected."""
+        return False
+
+    def read_status(self):
+        """Read UPS status. Returns standardized dict or None."""
+        raise NotImplementedError
+
+    def get_type_name(self):
+        """Human-readable UPS type."""
+        return "Unknown"
+
+    def get_connection_info(self):
+        """Human-readable connection info."""
+        return "—"
+
+    def get_hardware_info(self):
+        """Hardware-specific details dict."""
+        return {}
+
+
+class V3PBackend(UPSBackend):
+    """UART-based MakerFocus V3/V3P communication."""
 
     def __init__(self, port, baud, timeout):
         self.port = port
@@ -317,8 +420,7 @@ class UPSReader:
     def is_connected(self):
         return self._ser is not None and self._ser.is_open
 
-    def read_once(self):
-        """Read and parse one UPS status line. Returns dict or None."""
+    def read_status(self):
         if not self._ser:
             return None
         with self._lock:
@@ -334,14 +436,238 @@ class UPSReader:
         ups_ver, vin_str, bat_str, vout_str = m.groups()
         vin = vin_str.upper()
         return {
+            "ups_type": "v3p",
             "ups_version": ups_ver.strip(),
             "vin_state": vin,
             "ac_power": vin in VIN_AC,
             "bat_percent": int(bat_str),
             "vout_volts": int(vout_str) / 1000.0,
             "raw": raw,
+            # PiPower5-only fields (None for V3P)
+            "input_voltage_mv": None,
+            "input_current_ma": None,
+            "output_current_ma": None,
+            "battery_voltage_mv": None,
+            "battery_current_ma": None,
+            "input_power_w": None,
+            "output_power_w": None,
+            "battery_power_w": None,
+            "is_charging": None,
+            "estimated_runtime_min": None,
             "timestamp": int(time.time()),
         }
+
+    def get_type_name(self):
+        return "MakerFocus V3P"
+
+    def get_connection_info(self):
+        if self.is_connected():
+            return f"{self.port} connected"
+        return f"{self.port} not responding"
+
+    def get_hardware_info(self):
+        return {
+            "port": self.port,
+            "baud": self.baud,
+        }
+
+
+class PiPower5Backend(UPSBackend):
+    """I2C-based SunFounder PiPower 5 communication."""
+
+    # Register offsets within 25-byte block read (from spc library)
+    _OFF_INPUT_VOLTAGE = 0       # word (2 bytes)
+    _OFF_INPUT_CURRENT = 2       # word
+    _OFF_OUTPUT_VOLTAGE = 4      # word
+    _OFF_OUTPUT_CURRENT = 6      # word
+    _OFF_BATTERY_VOLTAGE = 8     # word
+    _OFF_BATTERY_CURRENT = 10    # word (signed)
+    _OFF_BATTERY_PERCENTAGE = 12 # byte
+    _OFF_BATTERY_CAPACITY = 13   # word
+    _OFF_POWER_SOURCE = 15       # byte
+    _OFF_IS_PLUGGED_IN = 16      # byte
+    _OFF_IS_CHARGING = 18        # byte
+    _OFF_SHUTDOWN_REQUEST = 20   # byte
+    _BLOCK_LENGTH = 25
+
+    def __init__(self, battery_capacity_wh=59.2):
+        self._bus = None
+        self._lock = threading.Lock()
+        self._battery_capacity_wh = battery_capacity_wh
+        self._power_history = collections.deque(maxlen=30)
+
+    def open(self):
+        if smbus2 is None:
+            print("smbus2 not installed", file=sys.stderr)
+            return False
+        try:
+            self._bus = smbus2.SMBus(PIPOWER5_BUS)
+            # Verify device responds
+            self._bus.read_byte(PIPOWER5_ADDR)
+            return True
+        except Exception as e:
+            print(f"Cannot open I2C: {e}", file=sys.stderr)
+            return False
+
+    def close(self):
+        if self._bus:
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+            self._bus = None
+
+    def is_connected(self):
+        if not self._bus:
+            return False
+        try:
+            self._bus.read_byte(PIPOWER5_ADDR)
+            return True
+        except Exception:
+            return False
+
+    def _read_block(self):
+        """Read the full 25-byte status block (matches SPC read_all)."""
+        with self._lock:
+            try:
+                return self._bus.read_i2c_block_data(
+                    PIPOWER5_ADDR, 0, self._BLOCK_LENGTH
+                )
+            except Exception:
+                return None
+
+    def _u16(self, data, offset):
+        """Unpack little-endian unsigned 16-bit value."""
+        return data[offset] | (data[offset + 1] << 8)
+
+    def _i16(self, data, offset):
+        """Unpack little-endian signed 16-bit value."""
+        val = self._u16(data, offset)
+        return val if val < 32768 else val - 65536
+
+    def read_status(self):
+        if not self._bus:
+            return None
+        raw = self._read_block()
+        if raw is None or len(raw) < self._BLOCK_LENGTH:
+            return None
+        try:
+            input_v = self._u16(raw, self._OFF_INPUT_VOLTAGE)
+            input_a = self._u16(raw, self._OFF_INPUT_CURRENT)
+            output_v = self._u16(raw, self._OFF_OUTPUT_VOLTAGE)
+            output_a = self._u16(raw, self._OFF_OUTPUT_CURRENT)
+            bat_v = self._u16(raw, self._OFF_BATTERY_VOLTAGE)
+            bat_a = self._i16(raw, self._OFF_BATTERY_CURRENT)
+            bat_pct = raw[self._OFF_BATTERY_PERCENTAGE]
+            power_src = raw[self._OFF_POWER_SOURCE]
+            plugged = raw[self._OFF_IS_PLUGGED_IN]
+            charging = raw[self._OFF_IS_CHARGING]
+            shutdown_req = raw[self._OFF_SHUTDOWN_REQUEST]
+
+            on_ac = (power_src == 0) and bool(plugged)
+            output_w = (output_v * output_a) / 1_000_000.0
+            input_w = (input_v * input_a) / 1_000_000.0
+            bat_w = (bat_v * abs(bat_a)) / 1_000_000.0
+
+            # Rolling average for runtime estimation
+            if output_w > 0:
+                self._power_history.append(output_w)
+            avg_power = (
+                sum(self._power_history) / len(self._power_history)
+                if self._power_history else 0
+            )
+            runtime_min = None
+            if avg_power > 0 and bat_pct > 0:
+                remaining_wh = (
+                    (bat_pct / 100.0) * self._battery_capacity_wh
+                )
+                runtime_min = int((remaining_wh / avg_power) * 60)
+
+            return {
+                "ups_type": "pipower5",
+                "ups_version": "PiPower 5",
+                "vin_state": "GOOD" if on_ac else "NG",
+                "ac_power": on_ac,
+                "bat_percent": min(100, max(0, bat_pct)),
+                "vout_volts": output_v / 1000.0,
+                # PiPower5-specific
+                "input_voltage_mv": input_v,
+                "input_current_ma": input_a,
+                "output_current_ma": output_a,
+                "battery_voltage_mv": bat_v,
+                "battery_current_ma": bat_a,
+                "input_power_w": round(input_w, 3),
+                "output_power_w": round(output_w, 3),
+                "battery_power_w": round(bat_w, 3),
+                "is_charging": bool(charging),
+                "estimated_runtime_min": runtime_min,
+                "shutdown_request": shutdown_req,
+                "timestamp": int(time.time()),
+            }
+        except Exception as e:
+            print(f"PiPower5 read failed: {e}", file=sys.stderr)
+            return None
+
+    def get_type_name(self):
+        return "SunFounder PiPower 5"
+
+    def get_connection_info(self):
+        if self.is_connected():
+            return f"I2C 0x{PIPOWER5_ADDR:02X} connected"
+        return f"I2C 0x{PIPOWER5_ADDR:02X} not responding"
+
+    def get_hardware_info(self):
+        """Read hardware info from extended registers."""
+        info = {}
+        if not self._bus:
+            return info
+        try:
+            with self._lock:
+                # Firmware version (regs 128, 129, 130)
+                fw = self._bus.read_i2c_block_data(
+                    PIPOWER5_ADDR, 128, 3
+                )
+                info["firmware"] = f"{fw[0]}.{fw[1]}.{fw[2]}"
+                # Shutdown percentage (reg 143)
+                info["shutdown_pct"] = self._bus.read_byte_data(
+                    PIPOWER5_ADDR, 143
+                )
+                # Max charge current (reg 155, N*100mA)
+                raw = self._bus.read_byte_data(PIPOWER5_ADDR, 155)
+                info["max_charge_ma"] = raw * 100
+                # Default on (reg 139)
+                info["default_on"] = bool(
+                    self._bus.read_byte_data(PIPOWER5_ADDR, 139)
+                )
+        except Exception as e:
+            print(f"PiPower5 hw info read failed: {e}",
+                  file=sys.stderr)
+        return info
+
+
+def create_backend(cfg):
+    """Auto-detect UPS hardware and create appropriate backend."""
+    ups_type = detect_ups_type()
+    if ups_type == "pipower5":
+        pp = cfg.get("pipower5", {})
+        return PiPower5Backend(
+            battery_capacity_wh=float(pp.get("battery_capacity_wh", 59.2))
+        )
+    elif ups_type == "v3p":
+        sc = cfg.get("serial", {})
+        return V3PBackend(
+            sc.get("port", "/dev/ttyAMA0"),
+            int(sc.get("baud", 9600)),
+            int(sc.get("timeout_s", 2)),
+        )
+    else:
+        # Default to V3P backend (will fail gracefully if no hardware)
+        sc = cfg.get("serial", {})
+        return V3PBackend(
+            sc.get("port", "/dev/ttyAMA0"),
+            int(sc.get("baud", 9600)),
+            int(sc.get("timeout_s", 2)),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -349,7 +675,7 @@ class UPSReader:
 # ═══════════════════════════════════════════════════════════════
 
 class PowerSaver:
-    """Switches CPU governor, frequency cap, refresh rate, and BT on AC change."""
+    """Switches CPU governor, frequency cap, Wi-Fi/BT, and refresh rate."""
 
     def __init__(self, cfg):
         self._prev_ac = None
@@ -363,18 +689,14 @@ class PowerSaver:
         self.bt_toggle = ps.get("disable_bluetooth", False)
         self.wifi_toggle = ps.get("disable_wifi", False)
         self.refresh_toggle = ps.get("reduce_refresh_rate", False)
-
-        # Frequency caps (kHz). 0 = use hardware max.
         self.max_freq_ac = int(ps.get("max_freq_ac", 0))
         self.max_freq_bat = int(ps.get("max_freq_battery", 0))
 
     def has_any_action(self):
-        """True if any power saver feature is enabled."""
         return (self.cpu_gov or self.bt_toggle or self.wifi_toggle
                 or self.refresh_toggle)
 
     def tick(self, data):
-        """Called each poll cycle. Switches profile on AC state change."""
         if data is None:
             return
         if not self.has_any_action():
@@ -398,9 +720,9 @@ class PowerSaver:
             if freqs:
                 self._set_max_freq(freqs[-1])
         if self.bt_toggle:
-            self._rfkill_bluetooth(block=False)
+            self._rfkill("bluetooth", block=False)
         if self.wifi_toggle:
-            self._rfkill_wifi(block=False)
+            self._rfkill("wifi", block=False)
 
     def _apply_battery(self):
         if self.cpu_gov:
@@ -408,16 +730,15 @@ class PowerSaver:
         if self.max_freq_bat > 0:
             self._set_max_freq(self.max_freq_bat)
         if self.bt_toggle:
-            self._rfkill_bluetooth(block=True)
+            self._rfkill("bluetooth", block=True)
         if self.wifi_toggle:
-            self._rfkill_wifi(block=True)
+            self._rfkill("wifi", block=True)
 
     def apply_refresh_rate(self):
-        """Set refresh rate based on config. Call at startup and on save."""
         if self.refresh_toggle:
-            set_refresh_rate(30)
+            return set_refresh_rate(30)
         else:
-            set_refresh_rate(60)
+            return set_refresh_rate(60)
 
     def _set_governor(self, gov):
         for policy in glob.glob(
@@ -437,7 +758,6 @@ class PowerSaver:
                 print(f"Governor set failed: {e}", file=sys.stderr)
 
     def _set_max_freq(self, freq_khz):
-        """Set scaling_max_freq for all CPU policies."""
         for policy in glob.glob(
             "/sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq"
         ):
@@ -454,22 +774,11 @@ class PowerSaver:
             except Exception as e:
                 print(f"Max freq set failed: {e}", file=sys.stderr)
 
-    def _rfkill_bluetooth(self, block):
+    def _rfkill(self, device, block):
         action = "block" if block else "unblock"
         try:
             subprocess.run(
-                ["rfkill", action, "bluetooth"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            pass
-
-    def _rfkill_wifi(self, block):
-        action = "block" if block else "unblock"
-        try:
-            subprocess.run(
-                ["rfkill", action, "wifi"],
+                ["rfkill", action, device],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -498,6 +807,11 @@ class ShutdownGuard:
 
     def tick(self, data):
         if not self.enabled or data is None:
+            return
+        # PiPower5: honor its own shutdown request immediately
+        if data.get("shutdown_request", 0) != 0:
+            print("PiPower5 shutdown request received", file=sys.stderr)
+            os.system(self.command)
             return
         if self._tripped:
             if data["bat_percent"] >= self.clear_pct:
@@ -642,15 +956,14 @@ def get_best_icon(percent, ac_power):
     return battery_icon_fallback(percent, ac_power)
 
 
-
 # ═══════════════════════════════════════════════════════════════
 # Settings Window (tabbed)
 # ═══════════════════════════════════════════════════════════════
 
 class BatterySettingsWindow(Gtk.Window):
-    """Tabbed settings window matching kiosk-manager UI pattern."""
+    """Tabbed settings window — adapts display based on UPS backend type."""
 
-    def __init__(self, parent_data, cfg, reader, on_save):
+    def __init__(self, parent_data, cfg, backend, on_save):
         super().__init__(title="Battery Monitor", default_width=420)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
@@ -659,7 +972,7 @@ class BatterySettingsWindow(Gtk.Window):
         self.cfg = _deep_copy(cfg)
         self.on_save = on_save
         self.parent_data = parent_data or {}
-        self.reader = reader
+        self.backend = backend
 
         self._build_ui()
 
@@ -684,22 +997,22 @@ class BatterySettingsWindow(Gtk.Window):
             pct = d.get("bat_percent", 0)
             state = f"Charging ({pct}%)" if pct < 95 else f"Full ({pct}%)"
         elif d.get("ac_power") is False:
-            state = f"Battery ({d.get('bat_percent', 0)}%)"
+            pct = d.get("bat_percent", 0)
+            rt = d.get("estimated_runtime_min")
+            if rt:
+                state = f"Battery ({pct}%, ~{rt} min)"
+            else:
+                state = f"Battery ({pct}%)"
         else:
             state = "Not connected"
 
-        port = self.cfg["serial"]["port"]
-        if self.reader and self.reader.is_connected():
-            port_str = f"{port} connected"
-        elif d:
-            port_str = f"{port} connected"
-        else:
-            port_str = f"{port} not responding"
+        conn = self.backend.get_connection_info() if self.backend else "—"
 
         info = Gtk.Label()
         info.set_markup(
-            f"<small>Status: <b>{state}</b>    "
-            f"Port: <b>{port_str}</b></small>"
+            f"<small>UPS: <b>{self.backend.get_type_name()}</b>    "
+            f"Status: <b>{state}</b>    "
+            f"<b>{conn}</b></small>"
         )
         info.set_xalign(0)
         outer.pack_start(info, False, False, 0)
@@ -726,11 +1039,42 @@ class BatterySettingsWindow(Gtk.Window):
         info_grid.set_margin_top(6)
         info_grid.set_margin_bottom(6)
 
-        self._add_info_row(info_grid, 0, "UPS Model:",
+        row = 0
+        self._add_info_row(info_grid, row, "UPS Type:",
                            d.get("ups_version", "—"))
-        self._add_info_row(info_grid, 1, "Output Voltage:",
-                           f"{d.get('vout_volts', 0):.2f} V"
-                           if d.get("vout_volts") else "—")
+        row += 1
+
+        # PiPower5: compact multi-value rows
+        if d.get("ups_type") == "pipower5":
+            in_v = d.get("input_voltage_mv")
+            in_w = d.get("input_power_w")
+            self._add_info_row(info_grid, row, "Input:",
+                               f"{in_v / 1000.0:.1f} V, "
+                               f"{d.get('input_current_ma', 0)} mA"
+                               f" ({in_w:.1f} W)"
+                               if in_v else "—")
+            row += 1
+            out_v = d.get("vout_volts", 0)
+            out_w = d.get("output_power_w")
+            self._add_info_row(info_grid, row, "Output:",
+                               f"{out_v:.2f} V, "
+                               f"{d.get('output_current_ma', 0)} mA"
+                               f" ({out_w:.1f} W)"
+                               if out_w else "—")
+            row += 1
+            bat_v = d.get("battery_voltage_mv")
+            rt = d.get("estimated_runtime_min")
+            rt_str = f", ~{rt} min" if rt else ""
+            self._add_info_row(info_grid, row, "Battery:",
+                               f"{bat_v / 1000.0:.2f} V, "
+                               f"{d.get('battery_current_ma', 0)} mA"
+                               f"{rt_str}"
+                               if bat_v else "—")
+        else:
+            # V3P: just output voltage
+            self._add_info_row(info_grid, row, "Output Voltage:",
+                               f"{d.get('vout_volts', 0):.2f} V"
+                               if d.get("vout_volts") else "—")
 
         info_frame.add(info_grid)
         settings_page.pack_start(info_frame, False, False, 0)
@@ -804,7 +1148,110 @@ class BatterySettingsWindow(Gtk.Window):
         nf_frame.add(nf_grid)
         settings_page.pack_start(nf_frame, False, False, 0)
 
-        # ═══ TAB 2: Power Saver ═══
+        # ═══ TAB 2: UPS ═══
+        ups_page = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        ups_page.set_margin_start(8)
+        ups_page.set_margin_end(8)
+        ups_page.set_margin_top(8)
+        ups_page.set_margin_bottom(8)
+        notebook.append_page(ups_page, Gtk.Label(label="UPS"))
+
+        hw = self.backend.get_hardware_info() if self.backend else {}
+        ups_type = d.get("ups_type", "")
+
+        if ups_type == "pipower5":
+            # Battery capacity
+            cap_frame = Gtk.Frame(label="  Battery  ")
+            cap_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+            cap_grid.set_margin_start(12)
+            cap_grid.set_margin_end(12)
+            cap_grid.set_margin_top(6)
+            cap_grid.set_margin_bottom(6)
+
+            cap_grid.attach(
+                Gtk.Label(label="Capacity:", xalign=0), 0, 0, 1, 1
+            )
+            pp = self.cfg.get("pipower5", {})
+            self.ups_capacity = Gtk.SpinButton.new_with_range(1, 200, 0.1)
+            self.ups_capacity.set_digits(1)
+            self.ups_capacity.set_value(
+                float(pp.get("battery_capacity_wh", 59.2))
+            )
+            cap_box = Gtk.Box(spacing=4)
+            cap_box.pack_start(self.ups_capacity, False, False, 0)
+            cap_box.pack_start(
+                Gtk.Label(label="Wh"), False, False, 0
+            )
+            cap_grid.attach(cap_box, 1, 0, 1, 1)
+
+            hint = Gtk.Label(xalign=0)
+            hint.set_markup(
+                "<small>Used for runtime estimation. "
+                "See README for calibration.</small>"
+            )
+            cap_grid.attach(hint, 0, 1, 2, 1)
+
+            cap_frame.add(cap_grid)
+            ups_page.pack_start(cap_frame, False, False, 0)
+
+            # Hardware info
+            hw_frame = Gtk.Frame(label="  Hardware  ")
+            hw_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+            hw_grid.set_margin_start(12)
+            hw_grid.set_margin_end(12)
+            hw_grid.set_margin_top(6)
+            hw_grid.set_margin_bottom(6)
+
+            self._add_info_row(hw_grid, 0, "Firmware:",
+                               hw.get("firmware", "—"))
+            self._add_info_row(hw_grid, 1, "Shutdown at:",
+                               f"{hw.get('shutdown_pct', '—')}%"
+                               if "shutdown_pct" in hw else "—")
+            self._add_info_row(hw_grid, 2, "Max charge:",
+                               f"{hw.get('max_charge_ma', '—')} mA"
+                               if "max_charge_ma" in hw else "—")
+            self._add_info_row(hw_grid, 3, "Default on:",
+                               "on" if hw.get("default_on") else "off")
+
+            hw_frame.add(hw_grid)
+            ups_page.pack_start(hw_frame, False, False, 0)
+
+        else:
+            # V3P: connection settings
+            conn_frame = Gtk.Frame(label="  Connection  ")
+            conn_grid = Gtk.Grid(column_spacing=12, row_spacing=4)
+            conn_grid.set_margin_start(12)
+            conn_grid.set_margin_end(12)
+            conn_grid.set_margin_top(6)
+            conn_grid.set_margin_bottom(6)
+
+            conn_grid.attach(
+                Gtk.Label(label="Serial port:", xalign=0), 0, 0, 1, 1
+            )
+            self.ups_port = Gtk.Entry()
+            self.ups_port.set_text(
+                self.cfg.get("serial", {}).get("port", "/dev/ttyAMA0")
+            )
+            conn_grid.attach(self.ups_port, 1, 0, 1, 1)
+
+            self._add_info_row(
+                conn_grid, 1, "Baud rate:",
+                str(hw.get("baud", 9600))
+            )
+
+            hint = Gtk.Label(xalign=0)
+            hint.set_markup(
+                "<small>Changes require restarting "
+                "battery-monitor.</small>"
+            )
+            conn_grid.attach(hint, 0, 2, 2, 1)
+
+            conn_frame.add(conn_grid)
+            ups_page.pack_start(conn_frame, False, False, 0)
+
+        # ═══ TAB 3: Power Saver ═══
         power_page = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=8
         )
@@ -890,7 +1337,7 @@ class BatterySettingsWindow(Gtk.Window):
         self.freq_bat_combo.set_active(bat_active)
         freq_grid.attach(self.freq_bat_combo, 1, 1, 1, 1)
 
-        # Live CPU status (updates every second)
+        # Live CPU status
         freq_grid.attach(Gtk.Label(label="Current:", xalign=0), 0, 2, 1, 1)
         self._freq_label = Gtk.Label(xalign=0)
         self._update_freq_label()
@@ -959,7 +1406,6 @@ class BatterySettingsWindow(Gtk.Window):
         grid.attach(val, 1, row, 1, 1)
 
     def _update_freq_label(self):
-        """Update the live CPU frequency and refresh rate display."""
         gov = PowerSaver(self.cfg).get_current_governor()
         cur = freq_khz_to_mhz(get_current_freq())
         cap = freq_khz_to_mhz(get_current_max_freq())
@@ -967,10 +1413,9 @@ class BatterySettingsWindow(Gtk.Window):
         if hasattr(self, "_refresh_label"):
             hz = get_current_refresh_rate()
             self._refresh_label.set_text(f"{hz} Hz" if hz else "—")
-        return True  # keep timer alive
+        return True
 
     def _on_destroy(self, _widget):
-        """Stop the freq update timer when window closes."""
         if hasattr(self, "_freq_timer"):
             GLib.source_remove(self._freq_timer)
 
@@ -1000,6 +1445,16 @@ class BatterySettingsWindow(Gtk.Window):
         self.cfg["notifications"]["warn_percent"] = int(
             self.nf_warn.get_value()
         )
+        # UPS tab
+        ups_type = self.parent_data.get("ups_type", "")
+        if ups_type == "pipower5" and hasattr(self, "ups_capacity"):
+            if "pipower5" not in self.cfg:
+                self.cfg["pipower5"] = {}
+            self.cfg["pipower5"]["battery_capacity_wh"] = round(
+                self.ups_capacity.get_value(), 1
+            )
+        elif hasattr(self, "ups_port"):
+            self.cfg["serial"]["port"] = self.ups_port.get_text().strip()
         # Power Saver tab
         self.cfg["power_saver"]["cpu_governor"] = self.ps_cpu.get_active()
         self.cfg["power_saver"]["disable_bluetooth"] = (
@@ -1014,11 +1469,126 @@ class BatterySettingsWindow(Gtk.Window):
         self.cfg["power_saver"]["max_freq_battery"] = (
             self._parse_freq_combo(self.freq_bat_combo)
         )
-        self.cfg["power_saver"]["reduce_refresh_rate"] = (
-            self.ps_refresh.get_active()
+
+        new_refresh = self.ps_refresh.get_active()
+
+        # If 30Hz is checked, handle with confirmation/revert
+        if new_refresh:
+            # Save everything EXCEPT the refresh rate change
+            self.cfg["power_saver"]["reduce_refresh_rate"] = False
+            self.on_save(self.cfg)
+            # Now run confirmation with manual 30Hz apply
+            self._confirm_refresh_change()
+        else:
+            self.cfg["power_saver"]["reduce_refresh_rate"] = False
+            self.cfg["power_saver"].pop("refresh_confirmed_display", None)
+            self.on_save(self.cfg)
+            self.destroy()
+
+    def _confirm_refresh_change(self):
+        """Apply 30Hz with a background safety revert.
+        Writes a revert script and runs it via nohup — fully independent
+        of the compositor and GTK process."""
+
+        # Write revert script
+        revert_script = "/tmp/battery-monitor-revert.sh"
+        revert_log = "/tmp/battery-monitor-revert.log"
+        wayland_disp = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
+        xdg_dir = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+        with open(revert_script, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f"exec >> {revert_log} 2>&1\n")
+            f.write("echo \"$(date): revert script started\"\n")
+            f.write("sleep 12\n")
+            f.write("echo \"$(date): killing kanshi\"\n")
+            f.write("pkill -9 kanshi\n")
+            f.write("sleep 2\n")
+            f.write(f"export WAYLAND_DISPLAY={wayland_disp}\n")
+            f.write(f"export XDG_RUNTIME_DIR={xdg_dir}\n")
+            f.write("echo \"$(date): starting kanshi\"\n")
+            f.write("kanshi &\n")
+            f.write("echo \"$(date): done\"\n")
+        os.chmod(revert_script, 0o755)
+
+        # Launch via os.system with shell backgrounding — most reliable
+        # way to create a fully detached process
+        os.system(f"nohup {revert_script} > /dev/null 2>&1 &")
+
+        # Verify revert process is running before changing display
+        time.sleep(0.5)
+        result = subprocess.run(
+            ["pgrep", "-f", "battery-monitor-revert"],
+            stdout=subprocess.DEVNULL,
         )
-        self.on_save(self.cfg)
-        self.destroy()
+        if result.returncode != 0:
+            print("WARNING: revert process failed to start",
+                  file=sys.stderr)
+
+        # Now apply the mode change
+        set_refresh_rate(30)
+
+        # Show confirmation dialog — if user can see it, display works
+        self._revert_seconds = 10
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            message_type=Gtk.MessageType.QUESTION,
+            text="Keep this refresh rate?",
+        )
+        dlg.format_secondary_text(
+            f"Reverting to 60 Hz in {self._revert_seconds} seconds..."
+        )
+        dlg.add_button("Revert Now", Gtk.ResponseType.CANCEL)
+        keep_btn = dlg.add_button("Keep 30 Hz", Gtk.ResponseType.OK)
+        keep_btn.get_style_context().add_class("suggested-action")
+
+        def _countdown():
+            self._revert_seconds -= 1
+            if self._revert_seconds <= 0:
+                dlg.response(Gtk.ResponseType.CANCEL)
+                return False
+            dlg.format_secondary_text(
+                f"Reverting to 60 Hz in {self._revert_seconds} seconds..."
+            )
+            return True
+
+        timer_id = GLib.timeout_add(1000, _countdown)
+        response = dlg.run()
+        GLib.source_remove(timer_id)
+        dlg.destroy()
+
+        if response == Gtk.ResponseType.OK:
+            # User confirmed — kill the revert script
+            subprocess.run(
+                ["pkill", "-f", "battery-monitor-revert"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                os.unlink(revert_script)
+            except FileNotFoundError:
+                pass
+            # Re-apply 30Hz in case revert already started
+            set_refresh_rate(30)
+            # NOW save config with refresh rate enabled
+            self.cfg["power_saver"]["reduce_refresh_rate"] = True
+            desc = get_display_description()
+            if desc:
+                self.cfg["power_saver"]["refresh_confirmed_display"] = desc
+            self.on_save(self.cfg)
+            self.destroy()
+        else:
+            # Wait for revert script to finish, or trigger manually
+            if os.path.exists(revert_script):
+                revert_refresh_rate()
+                try:
+                    os.unlink(revert_script)
+                except FileNotFoundError:
+                    pass
+            self.cfg["power_saver"]["reduce_refresh_rate"] = False
+            self.cfg["power_saver"].pop("refresh_confirmed_display", None)
+            self.on_save(self.cfg)
+            self.ps_refresh.set_active(False)
+            self.destroy()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1033,17 +1603,16 @@ class BatteryTray:
         self.data = None
         self._warned = False
 
-        self.reader = UPSReader(
-            self.cfg["serial"]["port"],
-            self.cfg["serial"]["baud"],
-            self.cfg["serial"]["timeout_s"],
-        )
+        print(f"Detecting UPS hardware...", file=sys.stderr)
+        self.backend = create_backend(self.cfg)
+        print(f"  UPS: {self.backend.get_type_name()}", file=sys.stderr)
+
         self.guard = ShutdownGuard(self.cfg)
         self.mqtt = MQTTPublisher(self.cfg)
         self.power = PowerSaver(self.cfg)
         self._cached_refresh_hz = get_current_refresh_rate()
 
-        # Apply refresh rate (fallback for non-kanshi systems)
+        # Apply refresh rate after compositor settles
         GLib.timeout_add_seconds(3, self._apply_startup_refresh)
 
         self._build_indicator()
@@ -1115,15 +1684,15 @@ class BatteryTray:
         if self.indicator:
             self.indicator.set_menu(self.menu)
 
-    # ── Serial reader (background thread) ────────────────────
+    # ── Reader (background thread) ───────────────────────────
 
     def _reader_loop(self):
         while True:
-            if not self.reader._ser:
-                if not self.reader.open():
+            if not self.backend.is_connected():
+                if not self.backend.open():
                     time.sleep(5)
                     continue
-            d = self.reader.read_once()
+            d = self.backend.read_status()
             if d:
                 self.data = d
                 self.guard.tick(d)
@@ -1154,7 +1723,11 @@ class BatteryTray:
             else:
                 status = f"Charging: {pct}%"
         else:
-            status = f"Battery: {pct}%"
+            rt = d.get("estimated_runtime_min")
+            if rt:
+                status = f"Battery: {pct}% (~{rt} min)"
+            else:
+                status = f"Battery: {pct}%"
 
         self.mi_status.set_label(status)
 
@@ -1190,25 +1763,35 @@ class BatteryTray:
             pass
 
     def _update_refresh_cache(self):
-        """Periodically update the cached refresh rate."""
         self._cached_refresh_hz = get_current_refresh_rate()
         return True
 
     def _apply_startup_refresh(self):
-        """Apply refresh rate after compositor settles.
-        Retries up to 5 times since kanshi may still be configuring."""
+        """Apply refresh rate at startup — only if this display was
+        previously confirmed to work at 30Hz."""
         if not self.power.refresh_toggle:
+            return False
+        # Only apply if the current display matches what was confirmed
+        confirmed = self.cfg.get("power_saver", {}).get(
+            "refresh_confirmed_display"
+        )
+        if not confirmed:
+            return False  # never confirmed, skip
+        current_display = get_display_description()
+        if not current_display or confirmed not in current_display:
+            print(f"Skipping 30Hz: display '{current_display}' "
+                  f"doesn't match confirmed '{confirmed}'",
+                  file=sys.stderr)
             return False
         if self.power.apply_refresh_rate():
             self._cached_refresh_hz = get_current_refresh_rate()
-            return False  # success, stop retrying
+            return False  # success
         self._refresh_retries = getattr(self, "_refresh_retries", 0) + 1
         if self._refresh_retries >= 5:
-            return False  # give up
-        return True  # retry in 3 seconds
+            return False
+        return True  # retry
 
     def _write_status_file(self, data):
-        """Write latest UPS data to a JSON file for external consumers."""
         try:
             enriched = dict(data)
             enriched["cpu_freq_mhz"] = freq_khz_to_mhz(get_current_freq())
@@ -1224,7 +1807,7 @@ class BatteryTray:
 
     def _on_settings(self, _widget):
         win = BatterySettingsWindow(
-            self.data, self.cfg, self.reader, self._save_settings
+            self.data, self.cfg, self.backend, self._save_settings
         )
         win.connect("destroy", lambda _: None)
         win.show_all()
@@ -1236,6 +1819,12 @@ class BatteryTray:
             self.mqtt.update_config(new_cfg)
             self.power.update_config(new_cfg)
             self.power.apply_refresh_rate()
+            # Update backend capacity if changed
+            if hasattr(self.backend, '_battery_capacity_wh'):
+                pp = new_cfg.get("pipower5", {})
+                self.backend._battery_capacity_wh = float(
+                    pp.get("battery_capacity_wh", 59.2)
+                )
 
     def _on_uninstall(self, _widget):
         dlg = Gtk.MessageDialog(
@@ -1250,7 +1839,7 @@ class BatteryTray:
         response = dlg.run()
         dlg.destroy()
         if response == Gtk.ResponseType.YES:
-            self.reader.close()
+            self.backend.close()
             try:
                 os.unlink(STATUS_FILE)
             except FileNotFoundError:
@@ -1263,12 +1852,13 @@ class BatteryTray:
             Gtk.main_quit()
 
     def _on_quit(self, _widget):
-        self.reader.close()
+        self.backend.close()
         try:
             os.unlink(STATUS_FILE)
         except FileNotFoundError:
             pass
         Gtk.main_quit()
+
 
 # ═══════════════════════════════════════════════════════════════
 # CLI Status
@@ -1277,8 +1867,13 @@ class BatteryTray:
 def cli_status():
     cfg = load_config()
     ps = PowerSaver(cfg)
+    ups_type = detect_ups_type() or "unknown"
     print(f"Battery Monitor v{VERSION}")
-    print(f"Serial port: {cfg['serial']['port']}")
+    print(f"UPS type:    {ups_type}")
+    if ups_type == "v3p":
+        print(f"Serial port: {cfg['serial']['port']}")
+    elif ups_type == "pipower5":
+        print(f"I2C bus:     {PIPOWER5_BUS}, addr 0x{PIPOWER5_ADDR:02X}")
     print(f"Shutdown at: {cfg['shutdown']['low_percent']}%"
           f" (confirm {cfg['shutdown']['confirm_seconds']}s)")
     print(f"Warning at:  {cfg['notifications']['warn_percent']}%")
@@ -1299,10 +1894,17 @@ def cli_status():
                     with open(STATUS_FILE, "r") as f:
                         d = json.load(f)
                     ac = "AC" if d.get("ac_power") else "BAT"
-                    print(f"  {d.get('vin_state','?')} "
-                          f"BAT={d.get('bat_percent',0)}%"
-                          f" V={d.get('vout_volts',0):.2f}V [{ac}]"
-                          f"  ({d.get('ups_version','?')})")
+                    pct = d.get("bat_percent", 0)
+                    ups = d.get("ups_type", "?")
+                    line = f"  BAT={pct}% [{ac}] ({ups})"
+                    # Add PiPower5 details
+                    out_w = d.get("output_power_w")
+                    if out_w is not None:
+                        line += f" {out_w:.1f}W"
+                    rt = d.get("estimated_runtime_min")
+                    if rt is not None:
+                        line += f" ~{rt}min"
+                    print(line)
                     time.sleep(2)
                 except (json.JSONDecodeError, KeyError):
                     time.sleep(1)
@@ -1310,30 +1912,35 @@ def cli_status():
             print("\nStopped.")
         return
 
-    # No tray running — try serial directly
-    reader = UPSReader(
-        cfg["serial"]["port"],
-        cfg["serial"]["baud"],
-        cfg["serial"]["timeout_s"],
-    )
-    if reader.open():
-        print("Reading UPS directly (Ctrl+C to stop)...")
+    # No tray running — try backend directly
+    backend = create_backend(cfg)
+    if backend.open():
+        print(f"Reading {backend.get_type_name()} directly "
+              f"(Ctrl+C to stop)...")
         try:
             while True:
-                d = reader.read_once()
+                d = backend.read_status()
                 if d:
                     ac = "AC" if d["ac_power"] else "BAT"
-                    print(f"  {d['vin_state']} BAT={d['bat_percent']}%"
-                          f" V={d['vout_volts']:.2f}V [{ac}]"
-                          f"  ({d['ups_version']})")
+                    pct = d["bat_percent"]
+                    line = f"  BAT={pct}% [{ac}] ({d.get('ups_version','?')})"
+                    out_w = d.get("output_power_w")
+                    if out_w is not None:
+                        line += f" {out_w:.1f}W"
+                    rt = d.get("estimated_runtime_min")
+                    if rt is not None:
+                        line += f" ~{rt}min"
+                    print(line)
+                else:
+                    time.sleep(0.5)
         except KeyboardInterrupt:
             print("\nStopped.")
         finally:
-            reader.close()
+            backend.close()
         return
 
-    print("ERROR: No status file and cannot open serial port.")
-    print("       Start the tray app or check the serial connection.")
+    print("ERROR: No status file and cannot open UPS connection.")
+    print("       Start the tray app or check hardware.")
 
 
 # ═══════════════════════════════════════════════════════════════

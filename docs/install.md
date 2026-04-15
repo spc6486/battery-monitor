@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Raspberry Pi (Pi 3, Pi 4, Pi 5 — see README for compatibility)
-- MakerFocus UPSPack V3P connected via UART (GPIO14/15)
+- SunFounder PiPower 5 (I2C) or MakerFocus UPSPack V3/V3P (UART)
 - Internet connection (for apt packages)
 
 ## Quick Install
