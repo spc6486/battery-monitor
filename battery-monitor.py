@@ -322,17 +322,14 @@ def revert_refresh_rate():
 
 def detect_ups_type():
     """Detect which UPS hardware is present. Returns 'pipower5', 'v3p', or None."""
-    # Try I2C first (PiPower 5) — read status block and verify sane values
+    # Try I2C first (PiPower 5) — use individual reads like SPC library
     if smbus2:
         try:
             bus = smbus2.SMBus(PIPOWER5_BUS)
-            # Read 25-byte status block from register 0 (matches SPC read_all)
-            raw = bus.read_i2c_block_data(PIPOWER5_ADDR, 0, 25)
+            # Read output voltage (word at reg 4) and battery % (byte at reg 12)
+            out_mv = bus.read_word_data(PIPOWER5_ADDR, 4)
+            pct = bus.read_byte_data(PIPOWER5_ADDR, 12)
             bus.close()
-            # Output voltage at offset 4 (little-endian word)
-            out_mv = raw[4] | (raw[5] << 8)
-            # Battery percentage at offset 12 (single byte)
-            pct = raw[12]
             # Sanity: output voltage 3000-6000 mV and percent 0-100
             if 3000 <= out_mv <= 6000 and 0 <= pct <= 100:
                 return "pipower5"
@@ -488,7 +485,6 @@ class PiPower5Backend(UPSBackend):
     _OFF_IS_PLUGGED_IN = 16      # byte
     _OFF_IS_CHARGING = 18        # byte
     _OFF_SHUTDOWN_REQUEST = 20   # byte
-    _BLOCK_LENGTH = 25
 
     def __init__(self, battery_capacity_wh=59.2):
         self._bus = None
@@ -526,43 +522,42 @@ class PiPower5Backend(UPSBackend):
         except Exception:
             return False
 
-    def _read_block(self):
-        """Read the full 25-byte status block (matches SPC read_all)."""
+    def _read_word(self, reg):
+        """Read a 16-bit little-endian unsigned value (matches SPC read_word_data)."""
         with self._lock:
             try:
-                return self._bus.read_i2c_block_data(
-                    PIPOWER5_ADDR, 0, self._BLOCK_LENGTH
-                )
+                return self._bus.read_word_data(PIPOWER5_ADDR, reg)
             except Exception:
-                return None
+                return 0
 
-    def _u16(self, data, offset):
-        """Unpack little-endian unsigned 16-bit value."""
-        return data[offset] | (data[offset + 1] << 8)
-
-    def _i16(self, data, offset):
-        """Unpack little-endian signed 16-bit value."""
-        val = self._u16(data, offset)
+    def _read_word_signed(self, reg):
+        """Read a 16-bit little-endian signed value."""
+        val = self._read_word(reg)
         return val if val < 32768 else val - 65536
+
+    def _read_byte(self, reg):
+        """Read a single byte (matches SPC read_byte_data)."""
+        with self._lock:
+            try:
+                return self._bus.read_byte_data(PIPOWER5_ADDR, reg)
+            except Exception:
+                return 0
 
     def read_status(self):
         if not self._bus:
             return None
-        raw = self._read_block()
-        if raw is None or len(raw) < self._BLOCK_LENGTH:
-            return None
         try:
-            input_v = self._u16(raw, self._OFF_INPUT_VOLTAGE)
-            input_a = self._u16(raw, self._OFF_INPUT_CURRENT)
-            output_v = self._u16(raw, self._OFF_OUTPUT_VOLTAGE)
-            output_a = self._u16(raw, self._OFF_OUTPUT_CURRENT)
-            bat_v = self._u16(raw, self._OFF_BATTERY_VOLTAGE)
-            bat_a = self._i16(raw, self._OFF_BATTERY_CURRENT)
-            bat_pct = raw[self._OFF_BATTERY_PERCENTAGE]
-            power_src = raw[self._OFF_POWER_SOURCE]
-            plugged = raw[self._OFF_IS_PLUGGED_IN]
-            charging = raw[self._OFF_IS_CHARGING]
-            shutdown_req = raw[self._OFF_SHUTDOWN_REQUEST]
+            input_v = self._read_word(self._OFF_INPUT_VOLTAGE)
+            input_a = self._read_word(self._OFF_INPUT_CURRENT)
+            output_v = self._read_word(self._OFF_OUTPUT_VOLTAGE)
+            output_a = self._read_word(self._OFF_OUTPUT_CURRENT)
+            bat_v = self._read_word(self._OFF_BATTERY_VOLTAGE)
+            bat_a = self._read_word_signed(self._OFF_BATTERY_CURRENT)
+            bat_pct = self._read_byte(self._OFF_BATTERY_PERCENTAGE)
+            power_src = self._read_byte(self._OFF_POWER_SOURCE)
+            plugged = self._read_byte(self._OFF_IS_PLUGGED_IN)
+            charging = self._read_byte(self._OFF_IS_CHARGING)
+            shutdown_req = self._read_byte(self._OFF_SHUTDOWN_REQUEST)
 
             on_ac = (power_src == 0) and bool(plugged)
             output_w = (output_v * output_a) / 1_000_000.0
@@ -624,10 +619,10 @@ class PiPower5Backend(UPSBackend):
         try:
             with self._lock:
                 # Firmware version (regs 128, 129, 130)
-                fw = self._bus.read_i2c_block_data(
-                    PIPOWER5_ADDR, 128, 3
-                )
-                info["firmware"] = f"{fw[0]}.{fw[1]}.{fw[2]}"
+                fw_maj = self._bus.read_byte_data(PIPOWER5_ADDR, 128)
+                fw_min = self._bus.read_byte_data(PIPOWER5_ADDR, 129)
+                fw_pat = self._bus.read_byte_data(PIPOWER5_ADDR, 130)
+                info["firmware"] = f"{fw_maj}.{fw_min}.{fw_pat}"
                 # Shutdown percentage (reg 143)
                 info["shutdown_pct"] = self._bus.read_byte_data(
                     PIPOWER5_ADDR, 143
